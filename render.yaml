@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: shuffle-stake-arbitrage-scanner
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: BANKROLL
+        value: "1000"
+      - key: MIN_ARB_PERCENT
+        value: "0.5"
+      - key: REQUEST_TIMEOUT
+        value: "10"
+      - key: STAKE_API_KEY
+        sync: false
+      - key: STAKE_API_KEY_HEADER
+        value: "apiKey"
+      - key: STAKE_SPORT
+        value: "football"
+      - key: SHUFFLE_GRAPHQL_URL
+        value: "https://shuffle.com/main-api/graphql/api/graphql"
+      - key: SHUFFLE_GRAPHQL_BODY
+        sync: false
