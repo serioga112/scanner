@@ -1,0 +1,3389 @@
+import os
+import json
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
+import requests
+from flask import Flask, jsonify, request, send_from_directory
+
+app = Flask(__name__, static_folder=None)
+
+SCANNER_VERSION = "v17-multisport"
+
+STAKE_BASE_URL = os.getenv("STAKE_BASE_URL", "https://odds-data.stake.com").rstrip("/")
+STAKE_API_KEY = os.getenv("STAKE_API_KEY", "").strip()
+STAKE_API_KEY_HEADER = os.getenv("STAKE_API_KEY_HEADER", "apiKey").strip()
+STAKE_SPORT = os.getenv("STAKE_SPORT", "football").strip()
+STAKE_FIXTURE_LIMIT = int(os.getenv("STAKE_FIXTURE_LIMIT", "60"))
+STAKE_DETAIL_WORKERS = max(1, min(int(os.getenv("STAKE_DETAIL_WORKERS", "4")), 8))
+
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "10"))
+
+# v14 continuous scanner / alert settings.
+BACKGROUND_SCANNER_ENABLED = os.getenv("BACKGROUND_SCANNER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+SCAN_INTERVAL_SECONDS = max(45, int(os.getenv("SCAN_INTERVAL_SECONDS", "60")))
+ALERT_MIN_ARB_PERCENT = float(os.getenv("ALERT_MIN_ARB_PERCENT", os.getenv("MIN_ARB_PERCENT", "0.5")))
+ALERT_BANKROLL = float(os.getenv("ALERT_BANKROLL", os.getenv("BANKROLL", "1000")))
+ALERT_COOLDOWN_SECONDS = max(60, int(os.getenv("ALERT_COOLDOWN_SECONDS", "900")))
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+_SCAN_LOCK = threading.Lock()
+_SCAN_STATE_LOCK = threading.Lock()
+_SCAN_STATE = {
+    "running": False,
+    "startedAt": None,
+    "lastStartedAt": None,
+    "lastFinishedAt": None,
+    "lastFetchSeconds": None,
+    "lastError": None,
+    "lastCandidateCount": 0,
+    "lastOpportunityCount": 0,
+    "lastOpportunities": [],
+    "lastClosest": [],
+    "alertsSent": 0,
+    "lastAlertAt": None,
+}
+_ALERT_HISTORY = {}
+_BACKGROUND_THREAD = None
+
+# SpinAndBet / BetConstruct Swarm WebSocket.
+# These defaults come from the public, unauthenticated sportsbook traffic we identified.
+SPIN_WS_URL = os.getenv("SPIN_WS_URL", "wss://eu-swarm-newm.spinandbet.net/").strip()
+SPIN_HTTP_URL = os.getenv(
+    "SPIN_HTTP_URL",
+    SPIN_WS_URL.replace("wss://", "https://", 1).replace("ws://", "http://", 1),
+).strip()
+SPIN_ORIGIN = os.getenv("SPIN_ORIGIN", "https://m.spinandbet.net").strip()
+SPIN_SITE_ID = int(os.getenv("SPIN_SITE_ID", "1033"))
+SPIN_SOURCE = int(os.getenv("SPIN_SOURCE", "6"))
+SPIN_LANGUAGE = os.getenv("SPIN_LANGUAGE", "eng").strip()
+SPIN_RELEASE_DATE = os.getenv("SPIN_RELEASE_DATE", "08/18/2026-14:55").strip()
+# Optional public-page client parameter seen in request_session.
+# Do not put cookies, account passwords, authorization headers, or logged-in session IDs here.
+SPIN_AFEC = os.getenv("SPIN_AFEC", "").strip()
+
+SPIN_EVENT_ID = int(os.getenv("SPIN_EVENT_ID", "30086420"))
+SPIN_COMPETITION_ID = int(os.getenv("SPIN_COMPETITION_ID", "538"))
+SPIN_SPORT_ALIAS = os.getenv("SPIN_SPORT_ALIAS", "Soccer").strip()
+SPIN_REGION_ALIAS = os.getenv("SPIN_REGION_ALIAS", "England").strip()
+SPIN_WS_TIMEOUT = float(os.getenv("SPIN_WS_TIMEOUT", "8"))
+SPIN_WS_MAX_MESSAGES = int(os.getenv("SPIN_WS_MAX_MESSAGES", "30"))
+
+
+def stake_headers():
+    headers = {"Accept": "application/json"}
+    if STAKE_API_KEY:
+        headers[STAKE_API_KEY_HEADER] = STAKE_API_KEY
+    return headers
+
+
+def stake_get(path):
+    r = requests.get(
+        f"{STAKE_BASE_URL}{path}",
+        headers=stake_headers(),
+        timeout=REQUEST_TIMEOUT,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def extract_fixture_list(payload):
+    if isinstance(payload, dict):
+        for key in ("fixture", "fixtures", "data", "results"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+def top_fixture(payload):
+    if isinstance(payload, dict):
+        f = payload.get("fixture")
+        if isinstance(f, dict):
+            return f
+        return payload
+    return {}
+
+
+def find_market_nodes(obj, path="$", found=None, limit=2000):
+    """
+    Recursively scan the entire fixture response.
+
+    A market node is any dict containing an `outcomes` list with at least
+    two usable outcome records. This avoids depending on Stake's exact
+    nesting level (groups, event groups, market groups, etc.).
+    """
+    if found is None:
+        found = []
+
+    if len(found) >= limit:
+        return found
+
+    if isinstance(obj, dict):
+        outcomes = obj.get("outcomes")
+
+        if isinstance(outcomes, list):
+            usable = []
+            for outcome in outcomes:
+                if not isinstance(outcome, dict):
+                    continue
+
+                selection = str(outcome.get("name", "")).strip()
+
+                try:
+                    odds = float(outcome.get("odds"))
+                except (TypeError, ValueError):
+                    continue
+
+                if selection and odds > 1:
+                    # Preserve line/type metadata when Stake attaches the total or
+                    # handicap to each outcome rather than the parent market node.
+                    usable.append({
+                        "selection": selection,
+                        "odds": odds,
+                        "type": outcome.get("type"),
+                        "lineValue": outcome.get("lineValue"),
+                        "line": outcome.get("line"),
+                        "handicap": outcome.get("handicap"),
+                        "points": outcome.get("points"),
+                        "base": outcome.get("base"),
+                    })
+
+            if len(usable) in (2, 3):
+                found.append({
+                    "path": path,
+                    "node": obj,
+                    "outcomes": usable,
+                })
+
+                if len(found) >= limit:
+                    return found
+
+        for key, value in obj.items():
+            find_market_nodes(value, f"{path}.{key}", found, limit)
+
+    elif isinstance(obj, list):
+        for i, value in enumerate(obj):
+            find_market_nodes(value, f"{path}[{i}]", found, limit)
+
+    return found
+
+
+def parse_fixture_recursive(payload):
+    fixture = top_fixture(payload)
+
+    event_id = str(
+        fixture.get("id")
+        or fixture.get("extId")
+        or fixture.get("slug")
+        or ""
+    )
+    event_name = str(fixture.get("name", ""))
+    event_slug = str(fixture.get("slug", ""))
+    start_time = fixture.get("startTime") or fixture.get("date")
+    tournament = fixture.get("tournament")
+    category = fixture.get("category")
+    sport = fixture.get("sport") or STAKE_SPORT
+
+    market_nodes = find_market_nodes(payload)
+    parsed = []
+    seen = set()
+
+    for item in market_nodes:
+        node = item["node"]
+        outcomes = item["outcomes"]
+
+        market_name = str(
+            node.get("name")
+            or node.get("marketName")
+            or node.get("label")
+            or node.get("title")
+            or "market"
+        ).strip()
+
+        # Deduplicate repeated appearances of the same market node.
+        sig = (
+            market_name.lower(),
+            tuple((o["selection"].lower(), o["odds"]) for o in outcomes),
+        )
+        if sig in seen:
+            continue
+        seen.add(sig)
+
+        parsed.append({
+            "bookmaker": "Stake",
+            "eventId": event_id,
+            "event": event_name,
+            "slug": event_slug,
+            "startTime": start_time,
+            "sport": sport,
+            "tournament": tournament,
+            "category": category,
+            "market": market_name,
+            "marketType": node.get("marketType") or node.get("type") or node.get("displayType"),
+            "lineValue": (
+                node.get("lineValue") if node.get("lineValue") is not None else
+                node.get("line") if node.get("line") is not None else
+                node.get("base") if node.get("base") is not None else
+                node.get("handicap") if node.get("handicap") is not None else
+                node.get("points")
+            ),
+            "jsonPath": item["path"],
+            "outcomes": outcomes,
+        })
+
+    return parsed
+
+
+def _flatten_stake_schedule(payload):
+    """Flatten GET /schedule/sport/{sport} into fixture dictionaries."""
+    fixtures = []
+    seen = set()
+
+    if not isinstance(payload, dict):
+        return fixtures
+
+    schedule = payload.get("schedule")
+    if not isinstance(schedule, list):
+        return fixtures
+
+    for bucket in schedule:
+        if not isinstance(bucket, dict):
+            continue
+        bucket_date = bucket.get("date")
+        rows = bucket.get("fixture") or bucket.get("fixtures") or []
+        if not isinstance(rows, list):
+            continue
+
+        for fixture in rows:
+            if not isinstance(fixture, dict):
+                continue
+            item = dict(fixture)
+            if item.get("date") is None and item.get("startTime") is None:
+                item["date"] = bucket_date
+            key = str(item.get("slug") or item.get("id") or item.get("extId") or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            fixtures.append(item)
+
+    return fixtures
+
+
+def _is_virtual_stake_fixture(fixture):
+    """Reject simulated/virtual football that must not match real Shuffle soccer."""
+    if not isinstance(fixture, dict):
+        return True
+
+    haystack = " ".join(str(fixture.get(k) or "") for k in (
+        "name", "slug", "tournament", "category", "type"
+    )).lower()
+
+    markers = (
+        " srl", "srl ", "-srl", "srl-",
+        "simulated reality", "simulated",
+        "esoccer", "e-soccer", "e soccer",
+        "cyber", "fifa bots", "fifa bot",
+    )
+    return any(marker in haystack for marker in markers)
+
+
+def fetch_stake_markets():
+    if not STAKE_API_KEY:
+        return {
+            "ok": False,
+            "fixtures": [],
+            "markets": [],
+            "errors": ["STAKE_API_KEY is not configured"],
+            "fixtureSource": None,
+            "rawFixturesDiscovered": 0,
+            "virtualFixturesFiltered": 0,
+        }
+
+    errors = []
+    fixtures_meta = []
+    markets = []
+    fixture_source = "schedule"
+
+    # The simple /sport/{sport}/fixture endpoint can return only a small
+    # featured slice. The schedule endpoint exposes the broader upcoming list.
+    try:
+        schedule_payload = stake_get(f"/schedule/sport/{STAKE_SPORT}")
+        fixtures = _flatten_stake_schedule(schedule_payload)
+        if not fixtures:
+            raise ValueError("schedule response contained no fixtures")
+    except Exception as schedule_exc:
+        fixture_source = "sport-fixture-fallback"
+        try:
+            fixture_list_payload = stake_get(f"/sport/{STAKE_SPORT}/fixture")
+            fixtures = extract_fixture_list(fixture_list_payload)
+            errors.append(
+                f"schedule-fallback: {type(schedule_exc).__name__}: {schedule_exc}"
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "fixtures": [],
+                "markets": [],
+                "errors": [
+                    f"schedule: {type(schedule_exc).__name__}: {schedule_exc}",
+                    f"fixture-list: {type(exc).__name__}: {exc}",
+                ],
+                "fixtureSource": None,
+                "rawFixturesDiscovered": 0,
+                "virtualFixturesFiltered": 0,
+            }
+
+    raw_count = len(fixtures)
+    real_fixtures = [f for f in fixtures if not _is_virtual_stake_fixture(f)]
+    virtual_filtered = raw_count - len(real_fixtures)
+
+    # Sort chronologically when Stake provides timestamps, then cap API work.
+    def fixture_sort_key(fixture):
+        value = fixture.get("startTime") or fixture.get("date")
+        try:
+            n = float(value)
+            if n > 10_000_000_000:
+                n /= 1000.0
+            return n
+        except (TypeError, ValueError):
+            return float("inf")
+
+    real_fixtures.sort(key=fixture_sort_key)
+
+    selected_fixtures = [
+        fixture for fixture in real_fixtures[:STAKE_FIXTURE_LIMIT]
+        if isinstance(fixture, dict)
+        and str(fixture.get("slug") or fixture.get("id") or "").strip()
+    ]
+
+    def fetch_one_fixture(fixture):
+        slug = str(fixture.get("slug") or fixture.get("id") or "").strip()
+        meta = {
+            "slug": slug,
+            "id": fixture.get("id"),
+            "name": fixture.get("name"),
+            "startTime": fixture.get("startTime") or fixture.get("date"),
+            "tournament": fixture.get("tournament"),
+            "category": fixture.get("category"),
+        }
+        try:
+            raw = stake_get(f"/fixtures/{slug}")
+            parsed = parse_fixture_recursive(raw)
+            return meta, parsed, None
+        except Exception as exc:
+            return meta, [], f"{slug}: {type(exc).__name__}: {exc}"
+
+    # Stake fixture detail calls are independent, so fetch a small controlled
+    # batch concurrently. This widens coverage without multiplying endpoint time
+    # by the number of fixtures.
+    with ThreadPoolExecutor(max_workers=STAKE_DETAIL_WORKERS) as pool:
+        for meta, parsed_markets, error in pool.map(fetch_one_fixture, selected_fixtures):
+            fixtures_meta.append(meta)
+            markets.extend(parsed_markets)
+            if error:
+                errors.append(error)
+
+    return {
+        "ok": len([e for e in errors if not e.startswith("schedule-fallback:")]) == 0,
+        "fixtures": fixtures_meta,
+        "markets": markets,
+        "errors": errors,
+        "fixtureSource": fixture_source,
+        "rawFixturesDiscovered": raw_count,
+        "virtualFixturesFiltered": virtual_filtered,
+    }
+
+
+@app.get("/")
+def home():
+    root = os.path.dirname(os.path.abspath(__file__))
+    return send_from_directory(root, "index.html")
+
+
+@app.get("/api/health")
+def health():
+    return jsonify({
+        "ok": True,
+        "version": SCANNER_VERSION,
+        "stakeConfigured": bool(STAKE_API_KEY),
+        "time": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+@app.get("/api/stake-debug")
+def stake_debug():
+    data = fetch_stake_markets()
+
+    return jsonify({
+        "ok": data["ok"],
+        "configured": bool(STAKE_API_KEY),
+        "baseUrl": STAKE_BASE_URL,
+        "sports": list(STAKE_SPORTS),
+        "fixtureLimitPerSport": STAKE_FIXTURE_LIMIT_PER_SPORT,
+        "detailWorkers": STAKE_DETAIL_WORKERS,
+        "fixtureSource": data.get("fixtureSource"),
+        "rawFixturesDiscovered": data.get("rawFixturesDiscovered"),
+        "virtualFixturesFiltered": data.get("virtualFixturesFiltered"),
+        "fixturesLoaded": len(data["fixtures"]),
+        "marketsLoaded": len(data["markets"]),
+        "quotesLoaded": sum(len(m["outcomes"]) for m in data["markets"]),
+        "sampleFixtures": data["fixtures"][:5],
+        "sampleMarkets": data["markets"][:10],
+        "errors": data["errors"][:20],
+    })
+
+
+@app.get("/api/stake-markets")
+def stake_markets():
+    data = fetch_stake_markets()
+
+    return jsonify({
+        "ok": data["ok"],
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "fixturesLoaded": len(data["fixtures"]),
+        "marketsLoaded": len(data["markets"]),
+        "quotesLoaded": sum(len(m["outcomes"]) for m in data["markets"]),
+        "markets": data["markets"],
+        "errors": data["errors"],
+    })
+
+
+# ---------------------------------------------------------------------------
+# Shuffle GraphQL sportsbook loader
+# ---------------------------------------------------------------------------
+
+SHUFFLE_GRAPHQL_URL = os.getenv(
+    "SHUFFLE_GRAPHQL_URL", "https://shuffle.com/main-api/graphql/sports/graphql-sports"
+).strip()
+SHUFFLE_ORIGIN = os.getenv("SHUFFLE_ORIGIN", "https://shuffle.com").strip()
+# Paste the public sportsbook GraphQL POST body captured from Shuffle into this
+# environment variable. Do not include account cookies or Authorization tokens.
+SHUFFLE_GRAPHQL_BODY = os.getenv("SHUFFLE_GRAPHQL_BODY", "").strip()
+
+# v6: use Shuffle's own Upcoming Soccer feed by default. The HAR captured from
+# the public sportsbook shows that the Upcoming tab calls GetSportsFixtures
+# with searchType=UPCOMING_ONLY and paginates with nextCursor.
+SHUFFLE_SCAN_MODE = os.getenv("SHUFFLE_SCAN_MODE", "UPCOMING").strip().upper()
+SHUFFLE_FIXTURE_PAGE_SIZE = int(os.getenv("SHUFFLE_FIXTURE_PAGE_SIZE", "25"))
+SHUFFLE_MAX_PAGES = int(os.getenv("SHUFFLE_MAX_PAGES", "10"))
+
+SHUFFLE_UPCOMING_QUERY = """query GetSportsFixtures($first: Int, $cursor: String, $sports: Sports, $categoryId: String, $competitionId: String, $searchType: SportsSearchType!, $language: Language, $prioritizedMarketTypeId: String) {
+  sportsFixtures: sportsFixturesV2(first: $first, cursor: $cursor, sports: $sports, categoryId: $categoryId, competitionId: $competitionId, searchType: $searchType, language: $language, prioritizedMarketTypeId: $prioritizedMarketTypeId)
+}"""
+
+
+def _shuffle_upcoming_body(cursor=None):
+    variables = {
+        "first": SHUFFLE_FIXTURE_PAGE_SIZE,
+        "language": "en",
+        "searchType": "UPCOMING_ONLY",
+        "sports": "SOCCER",
+    }
+    if cursor:
+        variables["cursor"] = cursor
+    return {
+        "operationName": "GetSportsFixtures",
+        "variables": variables,
+        "extensions": {
+            "clientLibrary": {
+                "name": "@apollo/client",
+                "version": "4.1.6",
+            }
+        },
+        "query": SHUFFLE_UPCOMING_QUERY,
+    }
+
+
+def _shuffle_headers():
+    return {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": SHUFFLE_ORIGIN,
+        "Referer": SHUFFLE_ORIGIN.rstrip("/") + "/sports",
+        "User-Agent": "Mozilla/5.0",
+    }
+
+
+def _shuffle_event_name(node, ctx):
+    for key in ("eventName", "fixtureName", "matchName", "name", "title"):
+        value = node.get(key)
+        if isinstance(value, str) and (" vs " in value.lower() or " v " in value.lower() or " - " in value):
+            return value.strip()
+
+    competitors = node.get("competitors")
+    if isinstance(competitors, list):
+        names = [
+            str(x.get("displayName") or x.get("name") or "").strip()
+            for x in competitors if isinstance(x, dict)
+        ]
+        names = [x for x in names if x]
+        if len(names) >= 2:
+            return f"{names[0]} - {names[1]}"
+
+    home = node.get("homeTeam") or node.get("home") or node.get("competitor1")
+    away = node.get("awayTeam") or node.get("away") or node.get("competitor2")
+
+    def label(v):
+        if isinstance(v, dict):
+            return str(v.get("name") or v.get("displayName") or v.get("label") or "").strip()
+        return str(v or "").strip()
+
+    h, a = label(home), label(away)
+    if h and a:
+        return f"{h} - {a}"
+    return ctx.get("event", "")
+
+
+def _shuffle_odds(outcome):
+    """Return decimal odds from Shuffle's sportsbook selection object.
+
+    Shuffle's sports GraphQL currently exposes fractional odds as strings such
+    as oddsNumerator="160", oddsDenominator="100". Those represent 160/100
+    fractional odds, i.e. decimal odds 2.60.
+    """
+    if not isinstance(outcome, dict):
+        return None
+
+    numerator = outcome.get("oddsNumerator")
+    denominator = outcome.get("oddsDenominator")
+    try:
+        n = float(numerator)
+        d = float(denominator)
+        if d > 0:
+            value = 1.0 + (n / d)
+            if value > 1.0:
+                return value
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+
+    for key in ("odds", "price", "decimalOdds", "decimal", "value"):
+        try:
+            value = float(outcome.get(key))
+            if value > 1:
+                return value
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _shuffle_competitor_names(fixture):
+    home = ""
+    away = ""
+    ordered = []
+    for item in fixture.get("competitors", []) or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("displayName") or item.get("name") or "").strip()
+        if not name:
+            continue
+        ordered.append(name)
+        if item.get("isHome") is True:
+            home = name
+        elif item.get("isHome") is False:
+            away = name
+    if not home and ordered:
+        home = ordered[0]
+    if not away and len(ordered) > 1:
+        away = ordered[1]
+    return home, away
+
+
+def _shuffle_selection_labels(display):
+    """Map Shuffle selection IDs/provider IDs to their human-readable labels."""
+    mapping = {}
+    if not isinstance(display, dict):
+        return mapping
+    for group in display.get("selectionGroups", []) or []:
+        if not isinstance(group, dict):
+            continue
+        group_name = str(group.get("name") or "").strip()
+        for selection in group.get("selections", []) or []:
+            if not isinstance(selection, dict):
+                continue
+            label = str(
+                selection.get("fullName")
+                or selection.get("name")
+                or group_name
+                or ""
+            ).strip()
+            if not label:
+                continue
+            for key in ("id", "providerId"):
+                value = selection.get(key)
+                if value:
+                    mapping[str(value)] = label
+    return mapping
+
+
+def _shuffle_market_type(group_name, outcomes):
+    raw = str(group_name or "").strip()
+    norm = _norm_text(raw)
+    labels = {_norm_text(x.get("selection")) for x in outcomes}
+    if len(outcomes) == 3 and ("draw" in labels or "x" in labels):
+        return "1X2"
+    if "threeway" in norm or "three way" in norm or "match result" in norm or "full time result" in norm:
+        return "1X2"
+    if "twoway" in norm or "two way" in norm:
+        return "2WAY"
+    return raw or "market"
+
+
+def _parse_shuffle_market_bundle(bundle, fixture_ctx, path, markets, seen):
+    if not isinstance(bundle, dict):
+        return
+
+    display = bundle.get("display") if isinstance(bundle.get("display"), dict) else {}
+    market_name = str(display.get("groupName") or display.get("groupKey") or "market").strip()
+    label_map = _shuffle_selection_labels(display)
+
+    odds_groups = bundle.get("odds")
+    if not isinstance(odds_groups, list):
+        return
+
+    for odds_index, odds_group in enumerate(odds_groups):
+        if not isinstance(odds_group, dict):
+            continue
+        if str(odds_group.get("status") or "OPEN").upper() not in {"OPEN", "ACTIVE", "TRADING"}:
+            continue
+
+        outcomes = []
+        for raw in odds_group.get("selections", []) or []:
+            if not isinstance(raw, dict):
+                continue
+            if str(raw.get("status") or "TRADING").upper() not in {"TRADING", "OPEN", "ACTIVE"}:
+                continue
+            odds = _shuffle_odds(raw)
+            if not odds:
+                continue
+            label = (
+                label_map.get(str(raw.get("id") or ""))
+                or label_map.get(str(raw.get("providerId") or ""))
+                or str(raw.get("name") or raw.get("label") or "").strip()
+            )
+            if not label:
+                continue
+            outcomes.append({
+                "selection": label,
+                "odds": round(odds, 6),
+                "selectionId": str(raw.get("id") or ""),
+                "providerId": str(raw.get("providerId") or ""),
+            })
+
+        if len(outcomes) not in (2, 3):
+            continue
+
+        market_type = _shuffle_market_type(market_name, outcomes)
+        event = fixture_ctx.get("event", "")
+        sig = (
+            fixture_ctx.get("eventId") or event.lower(),
+            _norm_text(market_name),
+            tuple(sorted((x["selection"].lower(), x["odds"]) for x in outcomes)),
+        )
+        if sig in seen:
+            continue
+        seen.add(sig)
+
+        markets.append({
+            "bookmaker": "Shuffle",
+            "eventId": fixture_ctx.get("eventId", ""),
+            "event": event,
+            "team1": fixture_ctx.get("team1", ""),
+            "team2": fixture_ctx.get("team2", ""),
+            "startTime": fixture_ctx.get("startTime"),
+            "status": fixture_ctx.get("status"),
+            "inPlay": bool(odds_group.get("inPlay")),
+            "sport": fixture_ctx.get("sport") or "football",
+            "tournament": fixture_ctx.get("tournament"),
+            "market": market_name,
+            "marketType": market_type,
+            "groupKey": display.get("groupKey"),
+            "displayType": display.get("displayType") or display.get("marketDisplayType"),
+            "lineValue": (
+                odds_group.get("lineValue") if odds_group.get("lineValue") is not None else
+                odds_group.get("line") if odds_group.get("line") is not None else
+                odds_group.get("base") if odds_group.get("base") is not None else
+                display.get("lineValue")
+            ),
+            "jsonPath": f"{path}.odds[{odds_index}]",
+            "outcomes": outcomes,
+        })
+
+
+def parse_shuffle_markets(payload):
+    """Normalize the current Shuffle sports GraphQL response.
+
+    The frontend response stores fixture odds under:
+      fixture.defaultMarketsInfo.defaultMarket
+      fixture.defaultMarketsInfo.threewayDefaultMarkets[]
+
+    Human-readable selection names are stored separately under
+    display.selectionGroups, so this parser joins them by selection ID.
+    """
+    root = payload.get("data", payload) if isinstance(payload, dict) else payload
+    markets = []
+    seen = set()
+
+    def walk(node, ctx, path="$", depth=0):
+        if depth > 30:
+            return
+        if isinstance(node, list):
+            for i, item in enumerate(node):
+                walk(item, ctx, f"{path}[{i}]", depth + 1)
+            return
+        if not isinstance(node, dict):
+            return
+
+        c = dict(ctx)
+
+        category = node.get("category")
+        if isinstance(category, dict):
+            sport = category.get("sports") or category.get("sport")
+            if sport:
+                c["sport"] = str(sport)
+            category_name = category.get("name")
+            if category_name:
+                c["category"] = str(category_name)
+
+        # Competition containers carry the tournament name and fixtures.
+        if isinstance(node.get("fixtures"), dict):
+            tournament = node.get("name") or node.get("title")
+            if tournament:
+                c["tournament"] = str(tournament)
+
+        default_info = node.get("defaultMarketsInfo")
+        if isinstance(default_info, dict):
+            home, away = _shuffle_competitor_names(node)
+            event = str(node.get("name") or "").strip()
+            if not event and home and away:
+                event = f"{home} - {away}"
+
+            fixture_ctx = dict(c)
+            fixture_ctx.update({
+                "eventId": str(node.get("id") or node.get("slug") or ""),
+                "event": event,
+                "team1": home,
+                "team2": away,
+                "startTime": node.get("startTime"),
+                "status": node.get("status"),
+            })
+
+            default_market = default_info.get("defaultMarket")
+            _parse_shuffle_market_bundle(
+                default_market,
+                fixture_ctx,
+                f"{path}.defaultMarketsInfo.defaultMarket",
+                markets,
+                seen,
+            )
+
+            for i, bundle in enumerate(default_info.get("threewayDefaultMarkets", []) or []):
+                _parse_shuffle_market_bundle(
+                    bundle,
+                    fixture_ctx,
+                    f"{path}.defaultMarketsInfo.threewayDefaultMarkets[{i}]",
+                    markets,
+                    seen,
+                )
+
+        for key, value in node.items():
+            # defaultMarketsInfo was already parsed explicitly; walking into it
+            # would only rediscover duplicate selection fragments.
+            if key == "defaultMarketsInfo":
+                continue
+            walk(value, c, f"{path}.{key}", depth + 1)
+
+    walk(root, {})
+    return markets
+
+def fetch_shuffle_markets():
+    """Fetch Shuffle soccer markets.
+
+    UPCOMING mode (default) reproduces the public Shuffle Upcoming tab:
+    GetSportsFixtures + UPCOMING_ONLY, following nextCursor automatically.
+    CUSTOM mode keeps compatibility with SHUFFLE_GRAPHQL_BODY.
+    """
+    use_upcoming = SHUFFLE_SCAN_MODE != "CUSTOM"
+
+    if not use_upcoming and not SHUFFLE_GRAPHQL_BODY:
+        return {
+            "ok": False,
+            "stage": "configuration",
+            "markets": [],
+            "errors": ["SHUFFLE_GRAPHQL_BODY is not configured for CUSTOM mode."],
+            "scanMode": SHUFFLE_SCAN_MODE,
+        }
+
+    if not use_upcoming:
+        try:
+            custom_body = json.loads(SHUFFLE_GRAPHQL_BODY)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "stage": "configuration",
+                "markets": [],
+                "errors": [f"Invalid SHUFFLE_GRAPHQL_BODY JSON: {exc}"],
+                "scanMode": SHUFFLE_SCAN_MODE,
+            }
+
+    markets = []
+    errors = []
+    pages_loaded = 0
+    fixtures_discovered = 0
+    cursor = None
+
+    try:
+        max_pages = SHUFFLE_MAX_PAGES if use_upcoming else 1
+
+        for page_index in range(max_pages):
+            body = _shuffle_upcoming_body(cursor) if use_upcoming else custom_body
+
+            response = requests.post(
+                SHUFFLE_GRAPHQL_URL,
+                headers=_shuffle_headers(),
+                json=body,
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            pages_loaded += 1
+
+            gql_errors = payload.get("errors", []) if isinstance(payload, dict) else []
+            if gql_errors:
+                errors.extend([
+                    {"page": page_index + 1, "error": item}
+                    for item in gql_errors
+                ])
+
+            page_markets = parse_shuffle_markets(payload)
+            markets.extend(page_markets)
+
+            if not use_upcoming:
+                break
+
+            sports_fixtures = (
+                payload.get("data", {}).get("sportsFixtures")
+                if isinstance(payload, dict)
+                and isinstance(payload.get("data"), dict)
+                else None
+            )
+
+            if not isinstance(sports_fixtures, dict):
+                break
+
+            nodes = sports_fixtures.get("nodes")
+            if isinstance(nodes, list):
+                fixtures_discovered += len(nodes)
+
+            next_cursor = sports_fixtures.get("nextCursor")
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+
+        # Cursor pages should be disjoint, but dedupe defensively.
+        unique = []
+        seen = set()
+        for market in markets:
+            key = (
+                market.get("eventId") or _norm_text(market.get("event")),
+                _norm_text(market.get("market")),
+                tuple(
+                    sorted(
+                        (
+                            _norm_text(outcome.get("selection")),
+                            float(outcome.get("odds") or 0),
+                        )
+                        for outcome in market.get("outcomes", [])
+                    )
+                ),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(market)
+
+        return {
+            "ok": len(errors) == 0,
+            "stage": "complete",
+            "scanMode": "UPCOMING" if use_upcoming else "CUSTOM",
+            "pagesLoaded": pages_loaded,
+            "fixturesDiscovered": fixtures_discovered,
+            "markets": unique,
+            "errors": errors,
+        }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "stage": "request",
+            "scanMode": "UPCOMING" if use_upcoming else "CUSTOM",
+            "pagesLoaded": pages_loaded,
+            "fixturesDiscovered": fixtures_discovered,
+            "markets": markets,
+            "errors": [f"{type(exc).__name__}: {exc}"],
+        }
+
+
+def _norm_text(value):
+    import re
+    import unicodedata
+    value = unicodedata.normalize("NFKD", str(value or ""))
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = value.lower().strip()
+    replacements = {
+        " utd ": " united ",
+        " st ": " saint ",
+    }
+    value = " " + value + " "
+    for old, replacement in replacements.items():
+        value = value.replace(old, replacement)
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return " ".join(value.split())
+
+
+def _normalize_team(value):
+    text = _norm_text(value)
+    if not text:
+        return ""
+    tokens = text.split()
+    # Club suffixes vary a lot between books and add no identity information.
+    suffixes = {"fc", "cf", "afc", "sc", "fk", "sk", "ac", "club"}
+    while len(tokens) > 1 and tokens[-1] in suffixes:
+        tokens.pop()
+    return " ".join(tokens)
+
+
+def _event_teams(market):
+    t1 = _normalize_team(market.get("team1"))
+    t2 = _normalize_team(market.get("team2"))
+    if t1 and t2:
+        return t1, t2
+
+    event = str(market.get("event") or "")
+    import re
+    parts = re.split(r"\s+(?:vs?\.?|[-–—])\s+", event, maxsplit=1, flags=re.I)
+    if len(parts) == 2:
+        return _normalize_team(parts[0]), _normalize_team(parts[1])
+    return _normalize_team(event), ""
+
+
+def _canonical_market_type(market):
+    raw = _norm_text(market.get("marketType") or market.get("market"))
+    compact = raw.replace(" ", "")
+    if compact in {"p1xp2", "1x2"}:
+        return "1x2"
+    if any(x in raw for x in ("match result", "full time result", "fulltime result", "threeway", "three way")):
+        return "1x2"
+
+    # Some feeds use a generic market name but the three outcomes themselves
+    # clearly identify the standard football 1-X-2 market.
+    outcomes = market.get("outcomes", []) or []
+    labels = {_norm_text(o.get("type") or o.get("selection") or o.get("name")) for o in outcomes if isinstance(o, dict)}
+    excluded = ("half", "corner", "card", "booking", "period", "set", "map", "quarter")
+    if len(outcomes) == 3 and not any(x in raw for x in excluded) and ("draw" in labels or "x" in labels):
+        return "1x2"
+    return raw
+
+
+def _team_similarity(a, b):
+    from difflib import SequenceMatcher
+    a = _normalize_team(a)
+    b = _normalize_team(b)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    ta, tb = set(a.split()), set(b.split())
+    jaccard = len(ta & tb) / max(1, len(ta | tb))
+    sequence = SequenceMatcher(None, a, b).ratio()
+    # Exact containment is useful for names such as "arsenal" vs "arsenal london".
+    containment = 1.0 if (a in b or b in a) and min(len(a), len(b)) >= 5 else 0.0
+    return max(sequence, jaccard, containment * 0.93)
+
+
+def _parse_start_time(value):
+    if value is None or value == "":
+        return None
+    try:
+        # Stake can return Unix epoch milliseconds while Shuffle uses ISO-8601.
+        if isinstance(value, (int, float)) or str(value).strip().isdigit():
+            ts = float(value)
+            if ts > 10_000_000_000:  # milliseconds
+                ts /= 1000.0
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+        s = str(value).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _event_context_flags(market):
+    # Prevent similarly named but fundamentally different fixtures from matching
+    # (for example Stake SRL/virtual football against a real Shuffle match).
+    import re
+    raw = _norm_text(" ".join(str(market.get(k) or "") for k in (
+        "event", "sport", "tournament", "category", "league"
+    )))
+    padded = f" {raw} "
+    return {
+        "simulated": any(x in padded for x in (
+            " srl ", " simulated ", " simulated reality ", " virtual "
+        )),
+        "esports": any(x in padded for x in (
+            " esports ", " esport ", " esoccer ", " e soccer "
+        )),
+        "women": any(x in padded for x in (
+            " women ", " womens ", " ladies ", " female "
+        )),
+        "reserve": any(x in padded for x in (
+            " reserves ", " reserve team ", " b team "
+        )),
+        "youth": bool(re.search(r"\b(?:u|under)\s?(?:16|17|18|19|20|21|23)\b|\byouth\b", raw)),
+    }
+
+
+def _event_match(market_a, market_b):
+    flags_a = _event_context_flags(market_a)
+    flags_b = _event_context_flags(market_b)
+    for key in flags_a:
+        if flags_a[key] != flags_b[key]:
+            return 0.0, False
+
+    a1, a2 = _event_teams(market_a)
+    b1, b2 = _event_teams(market_b)
+    if not all((a1, a2, b1, b2)):
+        return 0.0, False
+
+    direct_parts = (_team_similarity(a1, b1), _team_similarity(a2, b2))
+    swapped_parts = (_team_similarity(a1, b2), _team_similarity(a2, b1))
+    direct = sum(direct_parts) / 2
+    swapped = sum(swapped_parts) / 2
+    score, is_swapped, parts = (direct, False, direct_parts) if direct >= swapped else (swapped, True, swapped_parts)
+
+    # Both team names must independently be credible; this prevents one common
+    # club name from causing an unrelated fixture match.
+    if min(parts) < 0.72:
+        return 0.0, is_swapped
+
+    ta = _parse_start_time(market_a.get("startTime"))
+    tb = _parse_start_time(market_b.get("startTime"))
+    if ta and tb:
+        hours = abs((ta - tb).total_seconds()) / 3600.0
+        if hours > 6:
+            return 0.0, is_swapped
+        if hours <= 0.5:
+            score = min(1.0, score + 0.04)
+        elif hours > 2:
+            score -= 0.04
+
+    return score, is_swapped
+
+
+def _canonical_outcome(market, outcome):
+    raw = _normalize_team(outcome.get("type") or outcome.get("selection") or outcome.get("name"))
+    compact = raw.replace(" ", "")
+    if compact in {"p1", "1", "home", "team1", "w1"}:
+        return "1"
+    if compact in {"x", "draw", "tie"}:
+        return "X"
+    if compact in {"p2", "2", "away", "team2", "w2"}:
+        return "2"
+
+    t1, t2 = _event_teams(market)
+    if raw and _team_similarity(raw, t1) >= 0.88:
+        return "1"
+    if raw and _team_similarity(raw, t2) >= 0.88:
+        return "2"
+    return None
+
+
+def _dedupe_1x2(markets, bookmaker):
+    result = []
+    seen = set()
+    for market in markets:
+        if market.get("bookmaker") != bookmaker or _canonical_market_type(market) != "1x2":
+            continue
+        teams = _event_teams(market)
+        if not teams[0] or not teams[1]:
+            continue
+        # Prefer eventId where present, otherwise the normalized teams/start time.
+        event_key = str(market.get("eventId") or "").strip()
+        if not event_key:
+            start = _parse_start_time(market.get("startTime"))
+            start_key = start.strftime("%Y-%m-%dT%H:%M") if start else ""
+            event_key = f"{teams[0]}|{teams[1]}|{start_key}"
+        if event_key in seen:
+            continue
+        seen.add(event_key)
+        result.append(market)
+    return result
+
+
+def find_cross_book_matches(markets, threshold=0.82):
+    stake = _dedupe_1x2(markets, "Stake")
+    shuffle = _dedupe_1x2(markets, "Shuffle")
+    candidates = []
+
+    for sm in stake:
+        best = None
+        for hm in shuffle:
+            score, swapped = _event_match(sm, hm)
+            if score < threshold:
+                continue
+            if best is None or score > best[0]:
+                best = (score, swapped, hm)
+        if best:
+            score, swapped, hm = best
+            candidates.append({
+                "stake": sm,
+                "shuffle": hm,
+                "score": score,
+                "swapped": swapped,
+            })
+    return candidates
+
+
+def _best_outcomes_for_pair(stake_market, shuffle_market, swapped=False):
+    best = {}
+    for market in (stake_market, shuffle_market):
+        for outcome in market.get("outcomes", []) or []:
+            label = _canonical_outcome(market, outcome)
+            if label not in {"1", "X", "2"}:
+                continue
+            if market.get("bookmaker") == "Shuffle" and swapped:
+                if label == "1":
+                    label = "2"
+                elif label == "2":
+                    label = "1"
+            try:
+                odds = float(outcome.get("odds"))
+            except (TypeError, ValueError):
+                continue
+            if odds <= 1:
+                continue
+            candidate = {
+                "bookmaker": market.get("bookmaker"),
+                "selection": outcome.get("selection") or outcome.get("name") or label,
+                "canonicalSelection": label,
+                "odds": odds,
+            }
+            if label not in best or odds > best[label]["odds"]:
+                best[label] = candidate
+    return best
+
+
+def find_1x2_arbitrage(markets, bankroll, min_arb_percent):
+    results = []
+    seen_events = set()
+    for pair in find_cross_book_matches(markets):
+        stake_market = pair["stake"]
+        shuffle_market = pair["shuffle"]
+        best = _best_outcomes_for_pair(stake_market, shuffle_market, pair["swapped"])
+        if set(best) != {"1", "X", "2"}:
+            continue
+
+        arb_sum = sum(1.0 / best[x]["odds"] for x in ("1", "X", "2"))
+        arb_percent = (1.0 - arb_sum) * 100.0
+        if arb_sum >= 1.0 or arb_percent < min_arb_percent:
+            continue
+
+        teams = _event_teams(stake_market)
+        event_key = teams
+        if event_key in seen_events:
+            continue
+        seen_events.add(event_key)
+
+        guaranteed_return = bankroll / arb_sum
+        legs = []
+        for label in ("1", "X", "2"):
+            item = dict(best[label])
+            item["stake"] = round(bankroll * (1.0 / item["odds"]) / arb_sum, 2)
+            legs.append(item)
+
+        results.append({
+            "event": stake_market.get("event") or f"{teams[0]} - {teams[1]}",
+            "shuffleEvent": shuffle_market.get("event"),
+            "market": "1X2",
+            "matchConfidence": round(pair["score"], 4),
+            "arbPercent": round(arb_percent, 4),
+            "impliedProbabilitySum": round(arb_sum, 6),
+            "bankroll": bankroll,
+            "guaranteedReturn": round(guaranteed_return, 2),
+            "guaranteedProfit": round(guaranteed_return - bankroll, 2),
+            "legs": legs,
+        })
+
+    return sorted(results, key=lambda x: x["arbPercent"], reverse=True)
+
+
+
+# ---------------------------------------------------------------------------
+# v9 two-way focused arbitrage engine
+# ---------------------------------------------------------------------------
+# v9 intentionally ignores soccer 1X2. It asks Shuffle for the public
+# sportsbook's Total and Handicap default-market views directly by using the
+# same prioritizedMarketTypeId values exposed by Shuffle's GetSports query.
+# Only half-lines (x.5) are considered guaranteed two-way markets here.
+
+V9_SUPPORTED_FAMILIES = ("total", "spread")
+SHUFFLE_TOTAL_MARKET_TYPE_ID = os.getenv(
+    "SHUFFLE_TOTAL_MARKET_TYPE_ID", "18_BETRADAR"
+).strip()
+SHUFFLE_HANDICAP_MARKET_TYPE_ID = os.getenv(
+    "SHUFFLE_HANDICAP_MARKET_TYPE_ID", "16_BETRADAR"
+).strip()
+
+# Keep the previous loader available for CUSTOM mode compatibility.
+_fetch_shuffle_markets_pre_v9 = fetch_shuffle_markets
+
+
+def _raw_market_text(market):
+    return " ".join(str(market.get(k) or "") for k in (
+        "market", "marketType", "displayType", "groupKey"
+    )).strip()
+
+
+def _contains_any(text, terms):
+    return any(term in text for term in terms)
+
+
+def _is_team_specific_total_v11(market):
+    """Reject team totals such as 'Vissel Kobe Total' from full-match totals."""
+    import re
+
+    market_name = _norm_text(market.get("market") or "")
+    if not market_name:
+        return False
+
+    padded = f" {market_name} "
+    explicit_team_total_terms = (
+        " team total ", " home total ", " away total ",
+        " home team total ", " away team total ",
+        " team 1 total ", " team 2 total ",
+        " participant total ", " competitor total ",
+    )
+    if _contains_any(padded, explicit_team_total_terms):
+        return True
+
+    if "total" not in market_name and "over under" not in market_name:
+        return False
+
+    t1, t2 = _event_teams(market)
+    for team in (t1, t2):
+        team_norm = _normalize_team(team)
+        if not team_norm or len(team_norm) < 3:
+            continue
+        if team_norm in market_name:
+            return True
+
+        stripped = re.sub(
+            r"\b(?:asian|alternative|alt|team|match|total|totals|goal|goals|"
+            r"points|runs|sets|over|under)\b",
+            " ",
+            market_name,
+        )
+        stripped = " ".join(stripped.split())
+        if stripped and _team_similarity(stripped, team_norm) >= 0.86:
+            return True
+
+    return False
+
+
+def _is_main_match_market_v9(market):
+    """Reject props/period/team markets that are not full-match two-way markets."""
+    text = " " + _norm_text(_raw_market_text(market)) + " "
+    excluded = (
+        " first half ", " 1st half ", " second half ", " 2nd half ",
+        " half time ", " halftime ", " quarter ", " period ", " inning ",
+        " set ", " map ", " corner ", " corners ", " card ", " cards ",
+        " booking ", " bookings ", " player ", " scorer ", " shots ",
+        " throw in ", " offsides ", " penalty shootout ", " to qualify ",
+        " outright ", " early payout ", " 2up ", " 2 up ",
+        " team total ", " home total ", " away total ",
+        " home team total ", " away team total ",
+        " participant total ", " competitor total ",
+    )
+    if _contains_any(text, excluded):
+        return False
+    if _is_team_specific_total_v11(market):
+        return False
+    return True
+
+
+def _coerce_float(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+
+
+def _numbers_from_text(value):
+    import re
+    text = str(value or "").replace("−", "-").replace("–", "-").replace(",", ".")
+    return [float(x) for x in re.findall(r"(?<![A-Za-z0-9])([+-]?\d+(?:\.\d+)?)(?![A-Za-z0-9])", text)]
+
+
+def _line_is_half(value):
+    """Only x.5 lines are used: no push and no quarter-line split settlement."""
+    if value is None:
+        return False
+    doubled = abs(float(value) * 2.0)
+    return abs(doubled - round(doubled)) < 1e-8 and int(round(doubled)) % 2 == 1
+
+
+def _line_key(value):
+    value = float(value)
+    if abs(value) < 1e-10:
+        value = 0.0
+    text = f"{value:.3f}".rstrip("0").rstrip(".")
+    return text if text != "-0" else "0"
+
+
+def _selection_raw(outcome):
+    return str(outcome.get("selection") or outcome.get("name") or outcome.get("type") or "").strip()
+
+
+def _outcome_line(outcome):
+    for key in ("lineValue", "line", "handicap", "points", "base"):
+        value = _coerce_float(outcome.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _selection_team_side_v9(market, outcome):
+    """Return 1/2 for a team selection, tolerating handicap text around names."""
+    import re
+    raw = _selection_raw(outcome)
+    norm = _norm_text(raw)
+    compact = norm.replace(" ", "")
+    if compact in {"p1", "1", "home", "team1", "w1", "hometeam"}:
+        return "1"
+    if compact in {"p2", "2", "away", "team2", "w2", "awayteam"}:
+        return "2"
+
+    cleaned = raw.replace("−", "-").replace("–", "-")
+    cleaned = re.sub(r"[\(\[]?\s*[+-]?\d+(?:[\.,]\d+)?\s*[\)\]]?", " ", cleaned)
+    cleaned = re.sub(r"\b(?:home|away|team\s*[12]|p[12]|w[12])\b", " ", cleaned, flags=re.I)
+    cleaned_norm = _normalize_team(cleaned)
+
+    t1, t2 = _event_teams(market)
+    if cleaned_norm and t1 and _team_similarity(cleaned_norm, t1) >= 0.82:
+        return "1"
+    if cleaned_norm and t2 and _team_similarity(cleaned_norm, t2) >= 0.82:
+        return "2"
+
+    old = _canonical_outcome(market, outcome)
+    return old if old in {"1", "2"} else None
+
+
+def _over_under_side_v9(outcome):
+    import re
+    raw = _selection_raw(outcome).lower()
+    norm = _norm_text(raw)
+    if re.search(r"\bover\b", raw) or norm in {"o", "over"}:
+        return "over"
+    if re.search(r"\bunder\b", raw) or norm in {"u", "under"}:
+        return "under"
+    return None
+
+
+def _extract_total_line_v9(market):
+    # Provider-level structured line is the safest source.
+    structured = _coerce_float(market.get("lineValue"))
+    if structured is not None:
+        return abs(structured)
+
+    # Some Stake payloads attach the same total line to both outcomes.
+    outcome_lines = []
+    for outcome in market.get("outcomes", []) or []:
+        if _over_under_side_v9(outcome):
+            line = _outcome_line(outcome)
+            if line is not None:
+                outcome_lines.append(abs(line))
+    if outcome_lines and max(outcome_lines) - min(outcome_lines) < 1e-8:
+        return outcome_lines[0]
+
+    # Finally parse labels such as "Over 2.5" / "Under 2.5".
+    lines = []
+    for outcome in market.get("outcomes", []) or []:
+        if _over_under_side_v9(outcome):
+            nums = _numbers_from_text(_selection_raw(outcome))
+            if nums:
+                lines.append(abs(nums[-1]))
+    if lines and max(lines) - min(lines) < 1e-8:
+        return lines[0]
+
+    nums = _numbers_from_text(_raw_market_text(market))
+    return abs(nums[-1]) if nums else None
+
+
+def _extract_home_spread_line_v9(market):
+    # Prefer per-selection structured/text lines because they establish which
+    # sign belongs to team1/home.
+    home_lines = []
+    away_lines = []
+    for outcome in market.get("outcomes", []) or []:
+        side = _selection_team_side_v9(market, outcome)
+        line = _outcome_line(outcome)
+        if line is None:
+            nums = _numbers_from_text(_selection_raw(outcome))
+            if nums:
+                line = nums[-1]
+        if line is None:
+            continue
+        if side == "1":
+            home_lines.append(line)
+        elif side == "2":
+            away_lines.append(line)
+
+    if home_lines:
+        return home_lines[0]
+    if away_lines:
+        return -away_lines[0]
+
+    structured = _coerce_float(market.get("lineValue"))
+    if structured is not None:
+        return structured
+
+    nums = _numbers_from_text(_raw_market_text(market))
+    return nums[-1] if nums else None
+
+
+def _market_descriptor_v9(market, swapped=False):
+    """Return a canonical Total/Handicap descriptor, or None."""
+    if not _is_main_match_market_v9(market):
+        return None
+
+    outcomes = [x for x in (market.get("outcomes", []) or []) if isinstance(x, dict)]
+    if len(outcomes) != 2:
+        return None
+
+    raw = " " + _norm_text(_raw_market_text(market)) + " "
+    requested = str(market.get("requestedMarketFamily") or "").strip().lower()
+
+    ou_sides = {_over_under_side_v9(x) for x in outcomes}
+    ou_sides.discard(None)
+    looks_total = requested == "total" or ou_sides == {"over", "under"} or _contains_any(
+        raw, (" total ", " over under ", " over and under ", " number of goals ")
+    )
+    if looks_total and ou_sides == {"over", "under"}:
+        line = _extract_total_line_v9(market)
+        if not _line_is_half(line):
+            return None
+        key = f"total:{_line_key(line)}"
+        return {
+            "family": "total",
+            "key": key,
+            "line": line,
+            "label": f"Total {_line_key(line)}",
+        }
+
+    looks_spread = requested == "spread" or _contains_any(
+        raw, (" handicap ", " spread ", " asian handicap ", " match handicap ")
+    )
+    if looks_spread:
+        sides = {_selection_team_side_v9(market, x) for x in outcomes}
+        sides.discard(None)
+        if sides != {"1", "2"}:
+            return None
+        home_line = _extract_home_spread_line_v9(market)
+        if home_line is None:
+            return None
+        if swapped:
+            home_line = -home_line
+        if not _line_is_half(home_line):
+            return None
+        key = f"spread:{_line_key(home_line)}"
+        return {
+            "family": "spread",
+            "key": key,
+            "line": home_line,
+            "label": f"Handicap {_line_key(home_line)}",
+        }
+
+    return None
+
+
+def _canonical_selection_v9(market, outcome, descriptor, swapped=False):
+    family = descriptor.get("family")
+    if family == "total":
+        return _over_under_side_v9(outcome)
+    if family == "spread":
+        label = _selection_team_side_v9(market, outcome)
+        if swapped and label in {"1", "2"}:
+            label = "2" if label == "1" else "1"
+        return label
+    return None
+
+
+def _event_group_key_v9(market):
+    event_id = str(market.get("eventId") or "").strip()
+    if event_id:
+        return event_id
+    t1, t2 = _event_teams(market)
+    start = _parse_start_time(market.get("startTime"))
+    minute = start.strftime("%Y-%m-%dT%H:%M") if start else ""
+    return f"{t1}|{t2}|{minute}"
+
+
+def _book_event_groups_v9(markets, bookmaker):
+    groups = {}
+    for market in markets:
+        if market.get("bookmaker") != bookmaker:
+            continue
+        t1, t2 = _event_teams(market)
+        if not t1 or not t2:
+            continue
+        key = _event_group_key_v9(market)
+        groups.setdefault(key, []).append(market)
+    return list(groups.values())
+
+
+def _representative_market_v9(group):
+    # Prefer a recognized two-way market, then any market with event metadata.
+    ranked = []
+    for market in group:
+        desc = _market_descriptor_v9(market)
+        priority = {"total": 0, "spread": 1}.get(desc.get("family") if desc else None, 9)
+        ranked.append((priority, market))
+    ranked.sort(key=lambda x: x[0])
+    return ranked[0][1] if ranked else None
+
+
+def find_event_matches_v9(markets, threshold=0.82):
+    stake_groups = _book_event_groups_v9(markets, "Stake")
+    shuffle_groups = _book_event_groups_v9(markets, "Shuffle")
+    shuffle_reps = [(g, _representative_market_v9(g)) for g in shuffle_groups]
+    candidates = []
+
+    for sg in stake_groups:
+        sm = _representative_market_v9(sg)
+        if not sm:
+            continue
+        best = None
+        for hg, hm in shuffle_reps:
+            if not hm:
+                continue
+            score, swapped = _event_match(sm, hm)
+            if score < threshold:
+                continue
+            if best is None or score > best[0]:
+                best = (score, swapped, hg, hm)
+        if best:
+            score, swapped, hg, hm = best
+            candidates.append({
+                "stake": sm,
+                "shuffle": hm,
+                "stakeMarkets": sg,
+                "shuffleMarkets": hg,
+                "score": score,
+                "swapped": swapped,
+            })
+    return candidates
+
+
+def _descriptor_map_v9(group, swapped=False):
+    result = {}
+    for market in group:
+        desc = _market_descriptor_v9(market, swapped=swapped)
+        if not desc:
+            continue
+        result.setdefault(desc["key"], {"descriptor": desc, "markets": []})["markets"].append(market)
+    return result
+
+
+def _expected_labels_v9(family):
+    if family == "total":
+        return ("over", "under")
+    if family == "spread":
+        return ("1", "2")
+    return ()
+
+
+def _best_prices_v9(stake_markets, shuffle_markets, descriptor, swapped):
+    best = {}
+    for bookmaker, group, is_swapped in (
+        ("Stake", stake_markets, False),
+        ("Shuffle", shuffle_markets, swapped),
+    ):
+        for market in group:
+            desc = _market_descriptor_v9(market, swapped=is_swapped)
+            if not desc or desc.get("key") != descriptor.get("key"):
+                continue
+            for outcome in market.get("outcomes", []) or []:
+                label = _canonical_selection_v9(market, outcome, desc, swapped=is_swapped)
+                if label not in _expected_labels_v9(descriptor.get("family")):
+                    continue
+                try:
+                    odds = float(outcome.get("odds"))
+                except (TypeError, ValueError):
+                    continue
+                if odds <= 1.0:
+                    continue
+                candidate = {
+                    "bookmaker": bookmaker,
+                    "selection": _selection_raw(outcome) or label,
+                    "canonicalSelection": label,
+                    "odds": odds,
+                    "sourceMarket": market.get("market"),
+                    "line": descriptor.get("line"),
+                }
+                if label not in best or odds > best[label]["odds"]:
+                    best[label] = candidate
+    return best
+
+
+def _best_book_prices_v10(markets, descriptor, bookmaker, swapped=False):
+    """Best price for each side from one bookmaker on one exact canonical line."""
+    best = {}
+    expected = _expected_labels_v9(descriptor.get("family"))
+    for market in markets:
+        desc = _market_descriptor_v9(market, swapped=swapped)
+        if not desc or desc.get("key") != descriptor.get("key"):
+            continue
+        for outcome in market.get("outcomes", []) or []:
+            label = _canonical_selection_v9(market, outcome, desc, swapped=swapped)
+            if label not in expected:
+                continue
+            try:
+                odds = float(outcome.get("odds"))
+            except (TypeError, ValueError):
+                continue
+            if odds <= 1.0:
+                continue
+            candidate = {
+                "bookmaker": bookmaker,
+                "selection": _selection_raw(outcome) or label,
+                "canonicalSelection": label,
+                "odds": odds,
+                "sourceMarket": market.get("market"),
+                "line": descriptor.get("line"),
+            }
+            if label not in best or odds > best[label]["odds"]:
+                best[label] = candidate
+    return best
+
+
+def _cross_book_candidate_v10(pair, key, descriptor, bankroll):
+    """Return the best genuine Stake-vs-Shuffle two-leg combination for one line.
+
+    v9 selected the best price for each outcome globally and then rejected a line if
+    both best prices came from the same book. v10 explicitly checks both legal
+    cross-book orientations, so a valid near-miss or arbitrage is never hidden by
+    a slightly better same-book price.
+    """
+    labels = _expected_labels_v9(descriptor.get("family"))
+    if len(labels) != 2:
+        return None
+
+    stake_map = _descriptor_map_v9(pair["stakeMarkets"], swapped=False)
+    shuffle_map = _descriptor_map_v9(pair["shuffleMarkets"], swapped=pair["swapped"])
+    if key not in stake_map or key not in shuffle_map:
+        return None
+
+    stake_prices = _best_book_prices_v10(
+        stake_map[key]["markets"], descriptor, "Stake", swapped=False
+    )
+    shuffle_prices = _best_book_prices_v10(
+        shuffle_map[key]["markets"], descriptor, "Shuffle", swapped=pair["swapped"]
+    )
+
+    a, b = labels
+    combos = []
+    if a in stake_prices and b in shuffle_prices:
+        combos.append((stake_prices[a], shuffle_prices[b]))
+    if a in shuffle_prices and b in stake_prices:
+        combos.append((shuffle_prices[a], stake_prices[b]))
+    if not combos:
+        return None
+
+    best_combo = None
+    for leg1, leg2 in combos:
+        implied_sum = (1.0 / leg1["odds"]) + (1.0 / leg2["odds"])
+        arb_percent = (1.0 - implied_sum) * 100.0
+        if best_combo is None or arb_percent > best_combo[0]:
+            best_combo = (arb_percent, implied_sum, leg1, leg2)
+
+    arb_percent, implied_sum, leg1, leg2 = best_combo
+    balanced_return = bankroll / implied_sum
+    legs = []
+    for item in (leg1, leg2):
+        leg = dict(item)
+        leg["stake"] = round(bankroll * (1.0 / leg["odds"]) / implied_sum, 2)
+        legs.append(leg)
+
+    teams = _event_teams(pair["stake"])
+    return {
+        "event": pair["stake"].get("event") or f"{teams[0]} - {teams[1]}",
+        "shuffleEvent": pair["shuffle"].get("event"),
+        "market": descriptor.get("label"),
+        "marketFamily": descriptor.get("family"),
+        "marketKey": key,
+        "matchConfidence": round(pair["score"], 4),
+        "arbPercent": round(arb_percent, 4),
+        "distanceToArbitragePercent": round(max(0.0, -arb_percent), 4),
+        "impliedProbabilitySum": round(implied_sum, 6),
+        "bankroll": bankroll,
+        "balancedReturn": round(balanced_return, 2),
+        "balancedProfit": round(balanced_return - bankroll, 2),
+        "isArbitrage": implied_sum < 1.0,
+        "legs": legs,
+    }
+
+
+def find_twoway_candidates_v10(markets, bankroll):
+    """All matched two-way lines ranked from best arb to closest near-miss."""
+    results = []
+    seen = set()
+    for pair in find_event_matches_v9(markets):
+        stake_map = _descriptor_map_v9(pair["stakeMarkets"], swapped=False)
+        shuffle_map = _descriptor_map_v9(pair["shuffleMarkets"], swapped=pair["swapped"])
+        common_keys = sorted(set(stake_map) & set(shuffle_map))
+        for key in common_keys:
+            descriptor = stake_map[key]["descriptor"]
+            teams = _event_teams(pair["stake"])
+            unique_key = (teams, key)
+            if unique_key in seen:
+                continue
+            candidate = _cross_book_candidate_v10(pair, key, descriptor, bankroll)
+            if not candidate:
+                continue
+            seen.add(unique_key)
+            results.append(candidate)
+    return sorted(results, key=lambda x: x["arbPercent"], reverse=True)
+
+
+def find_twoway_arbitrage_v10(markets, bankroll, min_arb_percent):
+    return [
+        x for x in find_twoway_candidates_v10(markets, bankroll)
+        if x["isArbitrage"] and x["arbPercent"] >= min_arb_percent
+    ]
+
+
+def find_twoway_arbitrage_v9(markets, bankroll, min_arb_percent):
+    results = []
+    seen = set()
+    for pair in find_event_matches_v9(markets):
+        stake_map = _descriptor_map_v9(pair["stakeMarkets"], swapped=False)
+        shuffle_map = _descriptor_map_v9(pair["shuffleMarkets"], swapped=pair["swapped"])
+        common_keys = sorted(set(stake_map) & set(shuffle_map))
+
+        for key in common_keys:
+            descriptor = stake_map[key]["descriptor"]
+            labels = _expected_labels_v9(descriptor.get("family"))
+            if not labels:
+                continue
+            best = _best_prices_v9(
+                stake_map[key]["markets"],
+                shuffle_map[key]["markets"],
+                descriptor,
+                pair["swapped"],
+            )
+            if any(label not in best for label in labels):
+                continue
+            if len({best[label]["bookmaker"] for label in labels}) < 2:
+                continue
+
+            arb_sum = sum(1.0 / best[label]["odds"] for label in labels)
+            arb_percent = (1.0 - arb_sum) * 100.0
+            if arb_sum >= 1.0 or arb_percent < min_arb_percent:
+                continue
+
+            teams = _event_teams(pair["stake"])
+            unique_key = (teams, key)
+            if unique_key in seen:
+                continue
+            seen.add(unique_key)
+
+            guaranteed_return = bankroll / arb_sum
+            legs = []
+            for label in labels:
+                item = dict(best[label])
+                item["stake"] = round(bankroll * (1.0 / item["odds"]) / arb_sum, 2)
+                legs.append(item)
+
+            results.append({
+                "event": pair["stake"].get("event") or f"{teams[0]} - {teams[1]}",
+                "shuffleEvent": pair["shuffle"].get("event"),
+                "market": descriptor.get("label"),
+                "marketFamily": descriptor.get("family"),
+                "marketKey": key,
+                "matchConfidence": round(pair["score"], 4),
+                "arbPercent": round(arb_percent, 4),
+                "impliedProbabilitySum": round(arb_sum, 6),
+                "bankroll": bankroll,
+                "guaranteedReturn": round(guaranteed_return, 2),
+                "guaranteedProfit": round(guaranteed_return - bankroll, 2),
+                "legs": legs,
+            })
+
+    return sorted(results, key=lambda x: x["arbPercent"], reverse=True)
+
+
+def _market_family_counts_v9(markets, bookmaker):
+    counts = {name: 0 for name in V9_SUPPORTED_FAMILIES}
+    keys = set()
+    for market in markets:
+        if market.get("bookmaker") != bookmaker:
+            continue
+        desc = _market_descriptor_v9(market)
+        if not desc:
+            continue
+        signature = (_event_group_key_v9(market), desc["key"])
+        if signature in keys:
+            continue
+        keys.add(signature)
+        counts[desc["family"]] += 1
+    counts["totalComparable2WayMarkets"] = sum(counts.values())
+    return counts
+
+
+def _sample_comparable_v9(markets, bookmaker, limit=12):
+    samples = []
+    seen = set()
+    for market in markets:
+        if market.get("bookmaker") != bookmaker:
+            continue
+        desc = _market_descriptor_v9(market)
+        if not desc:
+            continue
+        key = (_event_group_key_v9(market), desc["key"])
+        if key in seen:
+            continue
+        seen.add(key)
+        samples.append({
+            "event": market.get("event"),
+            "startTime": market.get("startTime"),
+            "market": market.get("market"),
+            "marketType": market.get("marketType"),
+            "family": desc.get("family"),
+            "key": desc.get("key"),
+            "line": desc.get("line"),
+            "outcomes": market.get("outcomes"),
+            "requestedMarketFamily": market.get("requestedMarketFamily"),
+            "prioritizedMarketTypeId": market.get("prioritizedMarketTypeId"),
+        })
+        if len(samples) >= limit:
+            break
+    return samples
+
+
+def _shuffle_scan_prioritized_v9(family, market_type_id):
+    markets = []
+    errors = []
+    pages_loaded = 0
+    fixtures_discovered = 0
+    cursor = None
+
+    try:
+        for page_index in range(SHUFFLE_MAX_PAGES):
+            body = _shuffle_upcoming_body(cursor)
+            body["variables"]["prioritizedMarketTypeId"] = market_type_id
+
+            response = requests.post(
+                SHUFFLE_GRAPHQL_URL,
+                headers=_shuffle_headers(),
+                json=body,
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            pages_loaded += 1
+
+            gql_errors = payload.get("errors", []) if isinstance(payload, dict) else []
+            if gql_errors:
+                errors.extend([
+                    {"family": family, "page": page_index + 1, "error": item}
+                    for item in gql_errors
+                ])
+
+            page_markets = parse_shuffle_markets(payload)
+            for market in page_markets:
+                market["requestedMarketFamily"] = family
+                market["prioritizedMarketTypeId"] = market_type_id
+            markets.extend(page_markets)
+
+            sports_fixtures = (
+                payload.get("data", {}).get("sportsFixtures")
+                if isinstance(payload, dict) and isinstance(payload.get("data"), dict)
+                else None
+            )
+            if not isinstance(sports_fixtures, dict):
+                break
+
+            nodes = sports_fixtures.get("nodes")
+            if isinstance(nodes, list):
+                fixtures_discovered += len(nodes)
+
+            next_cursor = sports_fixtures.get("nextCursor")
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+
+    except Exception as exc:
+        errors.append({
+            "family": family,
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+
+    return {
+        "family": family,
+        "marketTypeId": market_type_id,
+        "pagesLoaded": pages_loaded,
+        "fixturesDiscovered": fixtures_discovered,
+        "markets": markets,
+        "errors": errors,
+    }
+
+
+def fetch_shuffle_markets():
+    """v9: fetch Shuffle Total and Handicap views in parallel.
+
+    Shuffle's sports UI exposes default market IDs 18_BETRADAR (Total) and
+    16_BETRADAR (Handicap). Passing one as prioritizedMarketTypeId makes that
+    two-way market the fixture's default market where available.
+    """
+    if SHUFFLE_SCAN_MODE == "CUSTOM":
+        return _fetch_shuffle_markets_pre_v9()
+
+    specs = [
+        ("total", SHUFFLE_TOTAL_MARKET_TYPE_ID),
+        ("spread", SHUFFLE_HANDICAP_MARKET_TYPE_ID),
+    ]
+
+    with ThreadPoolExecutor(max_workers=len(specs)) as pool:
+        futures = [pool.submit(_shuffle_scan_prioritized_v9, family, market_id) for family, market_id in specs]
+        scans = [future.result() for future in futures]
+
+    all_markets = []
+    all_errors = []
+    for scan in scans:
+        all_markets.extend(scan.get("markets", []))
+        all_errors.extend(scan.get("errors", []))
+
+    # The same fixture appears in both prioritized scans. Keep each distinct
+    # market/line once while preserving Total and Handicap side by side.
+    unique = []
+    seen = set()
+    for market in all_markets:
+        desc = _market_descriptor_v9(market)
+        descriptor_key = desc.get("key") if desc else (
+            _norm_text(market.get("market")),
+            _coerce_float(market.get("lineValue")),
+        )
+        key = (
+            market.get("eventId") or _norm_text(market.get("event")),
+            descriptor_key,
+            tuple(sorted(
+                (_norm_text(outcome.get("selection")), float(outcome.get("odds") or 0))
+                for outcome in market.get("outcomes", [])
+            )),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(market)
+
+    scan_info = [
+        {
+            "family": scan.get("family"),
+            "marketTypeId": scan.get("marketTypeId"),
+            "pagesLoaded": scan.get("pagesLoaded", 0),
+            "fixturesDiscovered": scan.get("fixturesDiscovered", 0),
+            "marketsLoaded": len(scan.get("markets", [])),
+            "errors": scan.get("errors", []),
+        }
+        for scan in scans
+    ]
+
+    return {
+        "ok": len(all_errors) == 0,
+        "stage": "complete",
+        "scanMode": "UPCOMING_TWO_WAY",
+        "pagesLoaded": sum(scan.get("pagesLoaded", 0) for scan in scans),
+        "fixturesDiscovered": max([scan.get("fixturesDiscovered", 0) for scan in scans] or [0]),
+        "markets": unique,
+        "errors": all_errors,
+        "prioritizedScans": scan_info,
+    }
+
+
+
+def _utc_now_iso_v14():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _candidate_fingerprint_v14(item):
+    """Stable key so the same arb is not repeatedly alerted every scan."""
+    legs = []
+    for leg in item.get("legs", []) or []:
+        legs.append((
+            str(leg.get("bookmaker") or ""),
+            str(leg.get("canonicalSelection") or ""),
+            str(leg.get("selection") or ""),
+            str(leg.get("line") or ""),
+        ))
+    return "|".join([
+        _norm_text(item.get("event")),
+        str(item.get("marketKey") or item.get("market") or ""),
+        repr(sorted(legs)),
+    ])
+
+
+def _format_alert_message_v14(item):
+    lines = [
+        "🚨 Stake ↔ Shuffle arbitrage",
+        f"Event: {item.get('event')}",
+        f"Market: {item.get('market')}",
+        f"Arb: {float(item.get('arbPercent') or 0):.2f}%",
+        f"Bankroll: {float(item.get('bankroll') or ALERT_BANKROLL):.2f}",
+        f"Guaranteed profit: {float(item.get('balancedProfit') or 0):.2f}",
+        "",
+    ]
+    for leg in item.get("legs", []) or []:
+        lines.append(
+            f"{leg.get('bookmaker')}: {leg.get('selection')} @ {leg.get('odds')} — stake {leg.get('stake')}"
+        )
+    lines.extend([
+        "",
+        "Re-check both live odds and market settlement before placing bets.",
+    ])
+    return "\n".join(lines)
+
+
+def _send_telegram_v14(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return {"sent": False, "reason": "telegram-not-configured"}
+    response = requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "disable_web_page_preview": True,
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        raise RuntimeError(f"Telegram API returned ok=false: {payload.get('description')}")
+    return {"sent": True}
+
+
+def _should_alert_v14(item, now_ts):
+    fingerprint = _candidate_fingerprint_v14(item)
+    previous = _ALERT_HISTORY.get(fingerprint)
+    if previous is not None and now_ts - previous < ALERT_COOLDOWN_SECONDS:
+        return False, fingerprint
+    return True, fingerprint
+
+
+def run_continuous_scan_once_v14(send_alerts=True):
+    """One complete Stake + Shuffle scan used by the background loop and status testing."""
+    if not _SCAN_LOCK.acquire(blocking=False):
+        return {"ok": False, "busy": True, "error": "scan-already-running"}
+
+    started_mono = time.monotonic()
+    started_at = _utc_now_iso_v14()
+    with _SCAN_STATE_LOCK:
+        _SCAN_STATE["running"] = True
+        _SCAN_STATE["lastStartedAt"] = started_at
+        _SCAN_STATE["lastError"] = None
+
+    try:
+        stake_data, shuffle_data, fetch_seconds = fetch_both_books_parallel()
+        combined = stake_data.get("markets", []) + shuffle_data.get("markets", [])
+        candidates = find_twoway_candidates_v10(combined, ALERT_BANKROLL)
+        opportunities = [
+            x for x in candidates
+            if x.get("isArbitrage") and float(x.get("arbPercent") or 0) >= ALERT_MIN_ARB_PERCENT
+        ]
+
+        sent = 0
+        alert_errors = []
+        now_ts = time.time()
+        if send_alerts:
+            for item in opportunities:
+                should_send, fingerprint = _should_alert_v14(item, now_ts)
+                if not should_send:
+                    continue
+                try:
+                    result = _send_telegram_v14(_format_alert_message_v14(item))
+                    if result.get("sent"):
+                        _ALERT_HISTORY[fingerprint] = now_ts
+                        sent += 1
+                except Exception as exc:
+                    alert_errors.append(f"{type(exc).__name__}: {exc}")
+
+        finished_at = _utc_now_iso_v14()
+        result = {
+            "ok": True,
+            "version": SCANNER_VERSION,
+            "startedAt": started_at,
+            "finishedAt": finished_at,
+            "scanSeconds": round(time.monotonic() - started_mono, 3),
+            "fetchSeconds": fetch_seconds,
+            "candidateCount": len(candidates),
+            "opportunityCount": len(opportunities),
+            "opportunities": opportunities[:20],
+            "closest": candidates[:5],
+            "alertsSentThisScan": sent,
+            "alertErrors": alert_errors,
+            "errors": {
+                "stake": stake_data.get("errors", []),
+                "shuffle": shuffle_data.get("errors", []),
+            },
+        }
+        with _SCAN_STATE_LOCK:
+            _SCAN_STATE.update({
+                "lastFinishedAt": finished_at,
+                "lastFetchSeconds": fetch_seconds,
+                "lastError": None if not alert_errors else "; ".join(alert_errors),
+                "lastCandidateCount": len(candidates),
+                "lastOpportunityCount": len(opportunities),
+                "lastOpportunities": opportunities[:20],
+                "lastClosest": candidates[:5],
+                "alertsSent": int(_SCAN_STATE.get("alertsSent") or 0) + sent,
+                "lastAlertAt": finished_at if sent else _SCAN_STATE.get("lastAlertAt"),
+            })
+        return result
+    except Exception as exc:
+        finished_at = _utc_now_iso_v14()
+        error = f"{type(exc).__name__}: {exc}"
+        with _SCAN_STATE_LOCK:
+            _SCAN_STATE.update({
+                "lastFinishedAt": finished_at,
+                "lastError": error,
+            })
+        return {
+            "ok": False,
+            "version": SCANNER_VERSION,
+            "startedAt": started_at,
+            "finishedAt": finished_at,
+            "error": error,
+        }
+    finally:
+        with _SCAN_STATE_LOCK:
+            _SCAN_STATE["running"] = False
+        _SCAN_LOCK.release()
+
+
+def _background_scanner_loop_v16():
+    """Long-running scanner loop. Exceptions are contained so the daemon survives."""
+    with _SCAN_STATE_LOCK:
+        _SCAN_STATE["startedAt"] = _utc_now_iso_v14()
+
+    # Give the web worker a few seconds to finish booting.
+    time.sleep(5)
+
+    while True:
+        cycle_started = time.monotonic()
+        try:
+            run_continuous_scan_once_v14(send_alerts=True)
+        except Exception as exc:
+            # run_continuous_scan_once_v14 already handles normal scan errors,
+            # but keep this guard so an unexpected exception cannot kill the thread.
+            with _SCAN_STATE_LOCK:
+                _SCAN_STATE["lastError"] = f"background-loop: {type(exc).__name__}: {exc}"
+
+        elapsed = time.monotonic() - cycle_started
+        time.sleep(max(5, SCAN_INTERVAL_SECONDS - elapsed))
+
+
+def _start_background_scanner_v16():
+    """Start/restart the scanner inside the actual Flask/Gunicorn worker."""
+    global _BACKGROUND_THREAD
+
+    if not BACKGROUND_SCANNER_ENABLED:
+        return False
+
+    if _BACKGROUND_THREAD is not None and _BACKGROUND_THREAD.is_alive():
+        return False
+
+    _BACKGROUND_THREAD = threading.Thread(
+        target=_background_scanner_loop_v16,
+        name="stake-shuffle-scanner",
+        daemon=True,
+    )
+    _BACKGROUND_THREAD.start()
+    return True
+
+
+@app.before_request
+def _ensure_background_scanner_v16():
+    # Important for Gunicorn --preload / worker forks:
+    # a thread created in the master process does not survive into the worker.
+    # Starting lazily on the first request guarantees the worker owns a live thread.
+    _start_background_scanner_v16()
+
+
+@app.get("/api/test-telegram")
+def test_telegram_v15():
+    """Send one harmless Telegram test message to verify configuration."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return jsonify({
+            "ok": False,
+            "version": SCANNER_VERSION,
+            "telegramConfigured": False,
+            "error": "telegram-not-configured",
+        }), 400
+
+    try:
+        result = _send_telegram_v14(
+            "✅ Stake ↔ Shuffle scanner test\n"
+            "Telegram alerts are configured correctly.\n"
+            f"Scanner version: {SCANNER_VERSION}"
+        )
+        return jsonify({
+            "ok": bool(result.get("sent")),
+            "version": SCANNER_VERSION,
+            "telegramConfigured": True,
+            "sent": bool(result.get("sent")),
+        })
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "version": SCANNER_VERSION,
+            "telegramConfigured": True,
+            "sent": False,
+            "errorType": type(exc).__name__,
+            "error": str(exc),
+        }), 500
+
+
+@app.get("/api/scanner-status")
+def scanner_status_v14():
+    with _SCAN_STATE_LOCK:
+        state = dict(_SCAN_STATE)
+    return jsonify({
+        "ok": True,
+        "version": SCANNER_VERSION,
+        "backgroundScannerEnabled": BACKGROUND_SCANNER_ENABLED,
+        "scanIntervalSeconds": SCAN_INTERVAL_SECONDS,
+        "minArbPercent": ALERT_MIN_ARB_PERCENT,
+        "bankroll": ALERT_BANKROLL,
+        "alertCooldownSeconds": ALERT_COOLDOWN_SECONDS,
+        "telegramConfigured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+        "backgroundThreadAlive": bool(_BACKGROUND_THREAD and _BACKGROUND_THREAD.is_alive()),
+        "backgroundThreadName": _BACKGROUND_THREAD.name if _BACKGROUND_THREAD else None,
+        "workerPid": os.getpid(),
+        "state": state,
+        "renderNote": "A free Render web service may sleep when inactive, so true 24/7 background alerts require an always-on service or an external scheduler.",
+    })
+
+
+@app.get("/api/scan-now")
+def scan_now_v14():
+    # Manual verification endpoint. It does not send Telegram alerts by default.
+    notify = str(request.args.get("notify", "0")).strip().lower() in {"1", "true", "yes"}
+    result = run_continuous_scan_once_v14(send_alerts=notify)
+    return jsonify(result), (200 if result.get("ok") else (409 if result.get("busy") else 500))
+
+
+
+
+@app.get("/api/shuffle-debug")
+def shuffle_debug():
+    data = fetch_shuffle_markets()
+    markets = data.get("markets", [])
+    return jsonify({
+        "ok": data.get("ok", False),
+        "version": SCANNER_VERSION,
+        "stage": data.get("stage"),
+        "graphqlUrl": SHUFFLE_GRAPHQL_URL,
+        "scanMode": data.get("scanMode"),
+        "totalMarketTypeId": SHUFFLE_TOTAL_MARKET_TYPE_ID,
+        "handicapMarketTypeId": SHUFFLE_HANDICAP_MARKET_TYPE_ID,
+        "prioritizedScans": data.get("prioritizedScans", []),
+        "marketsLoaded": len(markets),
+        "comparable2Way": _market_family_counts_v9(markets, "Shuffle"),
+        "sampleComparable2Way": _sample_comparable_v9(markets, "Shuffle", 10),
+        "errors": data.get("errors", []),
+    })
+
+
+@app.get("/api/shuffle-markets")
+def shuffle_markets():
+    data = fetch_shuffle_markets()
+    return jsonify({
+        "ok": data.get("ok", False),
+        "version": SCANNER_VERSION,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "marketsLoaded": len(data.get("markets", [])),
+        "quotesLoaded": sum(len(m.get("outcomes", [])) for m in data.get("markets", [])),
+        "markets": data.get("markets", []),
+        "prioritizedScans": data.get("prioritizedScans", []),
+        "errors": data.get("errors", []),
+    })
+
+
+def fetch_both_books_parallel():
+    """Fetch Stake plus Shuffle's two prioritized feeds concurrently."""
+    started = time.monotonic()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        stake_future = pool.submit(fetch_stake_markets)
+        shuffle_future = pool.submit(fetch_shuffle_markets)
+        stake_data = stake_future.result()
+        shuffle_data = shuffle_future.result()
+    return stake_data, shuffle_data, round(time.monotonic() - started, 3)
+
+
+@app.get("/api/twoway-debug")
+def twoway_debug():
+    try:
+        stake_data, shuffle_data, fetch_seconds = fetch_both_books_parallel()
+        combined = stake_data.get("markets", []) + shuffle_data.get("markets", [])
+        matches = find_event_matches_v9(combined)
+
+        common_event_count = 0
+        common_market_pairs = 0
+        family_common = {"total": 0, "spread": 0}
+        match_samples = []
+
+        for pair in matches:
+            stake_map = _descriptor_map_v9(pair["stakeMarkets"])
+            shuffle_map = _descriptor_map_v9(pair["shuffleMarkets"], swapped=pair["swapped"])
+            common = sorted(set(stake_map) & set(shuffle_map))
+            if common:
+                common_event_count += 1
+                common_market_pairs += len(common)
+                for key in common:
+                    family = stake_map[key]["descriptor"].get("family")
+                    if family in family_common:
+                        family_common[family] += 1
+            if len(match_samples) < 20:
+                match_samples.append({
+                    "stakeEvent": pair["stake"].get("event"),
+                    "shuffleEvent": pair["shuffle"].get("event"),
+                    "score": round(pair["score"], 4),
+                    "swapped": pair["swapped"],
+                    "common2WayMarkets": common,
+                })
+
+        return jsonify({
+            "ok": True,
+            "version": SCANNER_VERSION,
+            "fetchSeconds": fetch_seconds,
+            "supportedFamilies": list(V9_SUPPORTED_FAMILIES),
+            "stakeFixtureLimitPerSport": STAKE_FIXTURE_LIMIT_PER_SPORT,
+            "stakeDetailWorkers": STAKE_DETAIL_WORKERS,
+            "stakeRawFixturesDiscovered": stake_data.get("rawFixturesDiscovered"),
+            "stakeFixturesLoaded": len(stake_data.get("fixtures", [])),
+            "stakeMarketsLoaded": len(stake_data.get("markets", [])),
+            "shuffleMarketsLoaded": len(shuffle_data.get("markets", [])),
+            "stakeComparable": _market_family_counts_v9(combined, "Stake"),
+            "shuffleComparable": _market_family_counts_v9(combined, "Shuffle"),
+            "matchedEvents": len(matches),
+            "matchedEventsWithCommon2Way": common_event_count,
+            "common2WayMarketPairs": common_market_pairs,
+            "commonByFamily": family_common,
+            "shufflePrioritizedScans": shuffle_data.get("prioritizedScans", []),
+            "stakeSamples": _sample_comparable_v9(combined, "Stake", 10),
+            "shuffleSamples": _sample_comparable_v9(combined, "Shuffle", 10),
+            "sampleMatches": match_samples,
+            "errors": {
+                "stake": stake_data.get("errors", []),
+                "shuffle": shuffle_data.get("errors", []),
+            },
+        })
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "version": SCANNER_VERSION,
+            "stage": "twoway-debug",
+            "errorType": type(exc).__name__,
+            "error": str(exc),
+        }), 500
+
+
+@app.get("/api/match-debug")
+def match_debug():
+    # Keep the familiar URL but make its v9 output specifically about two-way markets.
+    return twoway_debug()
+
+
+@app.get("/api/closest")
+def closest_opportunities():
+    bankroll = float(request.args.get("bankroll", os.getenv("BANKROLL", "1000")))
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except ValueError:
+        limit = 20
+    limit = max(1, min(limit, 100))
+
+    try:
+        stake_data, shuffle_data, fetch_seconds = fetch_both_books_parallel()
+        combined = stake_data.get("markets", []) + shuffle_data.get("markets", [])
+        candidates = find_twoway_candidates_v10(combined, bankroll)
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "version": SCANNER_VERSION,
+            "stage": "closest",
+            "errorType": type(exc).__name__,
+            "error": str(exc),
+            "closest": [],
+        }), 500
+
+    family_counts = {name: 0 for name in V9_SUPPORTED_FAMILIES}
+    for item in candidates:
+        family = item.get("marketFamily")
+        if family in family_counts:
+            family_counts[family] += 1
+
+    return jsonify({
+        "ok": True,
+        "version": SCANNER_VERSION,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "fetchSeconds": fetch_seconds,
+        "bankroll": bankroll,
+        "supportedFamilies": list(V9_SUPPORTED_FAMILIES),
+        "candidateCounts": family_counts,
+        "totalCandidates": len(candidates),
+        "positiveArbitrages": sum(1 for x in candidates if x.get("isArbitrage")),
+        "note": "Sorted best first after strict full-match filtering. Team totals are excluded. Positive arbPercent is mathematical arbitrage only after the markets are confirmed equivalent; always re-check live odds and settlement rules before betting.",
+        "closest": candidates[:limit],
+        "errors": {
+            "stake": stake_data.get("errors", []),
+            "shuffle": shuffle_data.get("errors", []),
+        },
+    })
+
+
+@app.get("/api/opportunities")
+def opportunities():
+    bankroll = float(request.args.get("bankroll", os.getenv("BANKROLL", "1000")))
+    minimum = float(request.args.get("min_arb_percent", os.getenv("MIN_ARB_PERCENT", "0.5")))
+
+    try:
+        stake_data, shuffle_data, fetch_seconds = fetch_both_books_parallel()
+        combined = stake_data.get("markets", []) + shuffle_data.get("markets", [])
+        candidates = find_twoway_candidates_v10(combined, bankroll)
+        arbs = [x for x in candidates if x["isArbitrage"] and x["arbPercent"] >= minimum]
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "version": SCANNER_VERSION,
+            "stage": "opportunities",
+            "errorType": type(exc).__name__,
+            "error": str(exc),
+            "opportunities": [],
+        }), 500
+
+    family_counts = {name: 0 for name in V9_SUPPORTED_FAMILIES}
+    for arb in arbs:
+        family = arb.get("marketFamily")
+        if family in family_counts:
+            family_counts[family] += 1
+
+    return jsonify({
+        "ok": True,
+        "version": SCANNER_VERSION,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "fetchSeconds": fetch_seconds,
+        "bankroll": bankroll,
+        "minArbPercent": minimum,
+        "supportedFamilies": list(V9_SUPPORTED_FAMILIES),
+        "ignoredMarket": "Soccer 1X2 and team totals remain intentionally excluded.",
+        "safetyRule": "Full-match two-way moneyline is allowed for non-soccer sports; Total/Handicap still require half-lines (x.5). Team totals, period markets, whole lines, quarter lines, and soccer 1X2 are excluded.",
+        "stakeFixtureLimitPerSport": STAKE_FIXTURE_LIMIT_PER_SPORT,
+        "stakeDetailWorkers": STAKE_DETAIL_WORKERS,
+        "stakeRawFixturesDiscovered": stake_data.get("rawFixturesDiscovered"),
+        "stakeFixturesLoaded": len(stake_data.get("fixtures", [])),
+        "stakeMarketsLoaded": len(stake_data.get("markets", [])),
+        "shuffleMarketsLoaded": len(shuffle_data.get("markets", [])),
+        "stakeComparable": _market_family_counts_v9(combined, "Stake"),
+        "shuffleComparable": _market_family_counts_v9(combined, "Shuffle"),
+        "opportunityCounts": family_counts,
+        "opportunities": arbs,
+        "closest": candidates[:10],
+        "closestNote": "arbPercent above 0 is arbitrage; negative values show how far the best cross-book pair is from arbitrage.",
+        "errors": {
+            "stake": stake_data.get("errors", []),
+            "shuffle": shuffle_data.get("errors", []),
+        },
+    })
+
+
+
+@app.get("/api/spread-debug")
+def spread_debug():
+    """Show how Stake and Shuffle encode handicap lines on matched fixtures.
+
+    This endpoint is diagnostic only. It does not relax arbitrage safety rules.
+    """
+    try:
+        stake_data, shuffle_data, fetch_seconds = fetch_both_books_parallel()
+        combined = stake_data.get("markets", []) + shuffle_data.get("markets", [])
+        matches = find_event_matches_v9(combined)
+
+        rows = []
+        events_with_spread_both = 0
+        events_with_common_spread = 0
+
+        for pair in matches:
+            stake_items = []
+            shuffle_items = []
+
+            for market in pair["stakeMarkets"]:
+                desc = _market_descriptor_v9(market, swapped=False)
+                if desc and desc.get("family") == "spread":
+                    stake_items.append({
+                        "key": desc.get("key"),
+                        "line": desc.get("line"),
+                        "market": market.get("market"),
+                        "event": market.get("event"),
+                        "outcomes": [
+                            {
+                                "selection": _selection_raw(o),
+                                "side": _canonical_selection_v9(market, o, desc, swapped=False),
+                                "rawLine": _outcome_line(o),
+                                "odds": o.get("odds"),
+                            }
+                            for o in (market.get("outcomes", []) or [])
+                            if isinstance(o, dict)
+                        ],
+                    })
+
+            for market in pair["shuffleMarkets"]:
+                desc = _market_descriptor_v9(market, swapped=pair["swapped"])
+                if desc and desc.get("family") == "spread":
+                    shuffle_items.append({
+                        "key": desc.get("key"),
+                        "line": desc.get("line"),
+                        "market": market.get("market"),
+                        "event": market.get("event"),
+                        "outcomes": [
+                            {
+                                "selection": _selection_raw(o),
+                                "side": _canonical_selection_v9(
+                                    market, o, desc, swapped=pair["swapped"]
+                                ),
+                                "rawLine": _outcome_line(o),
+                                "odds": o.get("odds"),
+                            }
+                            for o in (market.get("outcomes", []) or [])
+                            if isinstance(o, dict)
+                        ],
+                    })
+
+            stake_keys = sorted({x["key"] for x in stake_items})
+            shuffle_keys = sorted({x["key"] for x in shuffle_items})
+            common = sorted(set(stake_keys) & set(shuffle_keys))
+
+            if stake_items and shuffle_items:
+                events_with_spread_both += 1
+            if common:
+                events_with_common_spread += 1
+
+            if stake_items or shuffle_items:
+                rows.append({
+                    "stakeEvent": pair["stake"].get("event"),
+                    "shuffleEvent": pair["shuffle"].get("event"),
+                    "matchScore": round(pair["score"], 4),
+                    "swapped": pair["swapped"],
+                    "stakeSpreadKeys": stake_keys,
+                    "shuffleSpreadKeys": shuffle_keys,
+                    "commonSpreadKeys": common,
+                    "stakeSpreads": stake_items[:8],
+                    "shuffleSpreads": shuffle_items[:8],
+                })
+
+        return jsonify({
+            "ok": True,
+            "version": SCANNER_VERSION,
+            "fetchSeconds": fetch_seconds,
+            "matchedEvents": len(matches),
+            "eventsWithSpreadOnBothBooks": events_with_spread_both,
+            "eventsWithCommonSpread": events_with_common_spread,
+            "note": "Diagnostic only. Compare stakeSpreadKeys and shuffleSpreadKeys for the same fixture before changing handicap normalization.",
+            "sampleEvents": rows[:20],
+            "errors": {
+                "stake": stake_data.get("errors", []),
+                "shuffle": shuffle_data.get("errors", []),
+            },
+        })
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "version": SCANNER_VERSION,
+            "stage": "spread-debug",
+            "errorType": type(exc).__name__,
+            "error": str(exc),
+        }), 500
+
+
+
+
+# ---------------------------------------------------------------------------
+# v17 multi-sport expansion
+# ---------------------------------------------------------------------------
+# Keep the proven v16 background-worker design, but widen both books beyond
+# soccer.  Defaults are intentionally conservative enough for a small Render
+# instance; more sports can be enabled later with STAKE_SPORTS.
+
+SCANNER_VERSION = "v17-multisport"
+
+
+def _csv_env_v17(name, default):
+    raw = os.getenv(name, default)
+    values = []
+    seen = set()
+    for part in str(raw or "").split(","):
+        value = part.strip().lower().replace("_", "-")
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        values.append(value)
+    return tuple(values)
+
+
+# Default expansion: soccer + three strong two-way sports.  The mappings below
+# also support volleyball/table-tennis/baseball if the user later adds them to
+# STAKE_SPORTS without another code change.
+STAKE_SPORTS = _csv_env_v17(
+    "STAKE_SPORTS",
+    "football,basketball,tennis,ice-hockey",
+)
+STAKE_FIXTURE_LIMIT_PER_SPORT = max(
+    5, min(int(os.getenv("STAKE_FIXTURE_LIMIT_PER_SPORT", "20")), 60)
+)
+SHUFFLE_OTHER_SPORT_MAX_PAGES = max(
+    1, min(int(os.getenv("SHUFFLE_OTHER_SPORT_MAX_PAGES", "4")), 10)
+)
+
+_STAKE_TO_SHUFFLE_SPORT_V17 = {
+    "football": "SOCCER",
+    "soccer": "SOCCER",
+    "basketball": "BASKETBALL",
+    "tennis": "TENNIS",
+    "ice-hockey": "ICE_HOCKEY",
+    "hockey": "ICE_HOCKEY",
+    "volleyball": "VOLLEYBALL",
+    "table-tennis": "TABLE_TENNIS",
+    "baseball": "BASEBALL",
+    "american-football": "AMERICAN_FOOTBALL",
+}
+
+
+def _canonical_sport_v17(value):
+    if isinstance(value, dict):
+        value = value.get("slug") or value.get("name") or value.get("id") or ""
+    text = _norm_text(value).replace("_", " ").replace("-", " ")
+    aliases = {
+        "football": "soccer",
+        "soccer": "soccer",
+        "basketball": "basketball",
+        "tennis": "tennis",
+        "ice hockey": "ice-hockey",
+        "hockey": "ice-hockey",
+        "volleyball": "volleyball",
+        "table tennis": "table-tennis",
+        "baseball": "baseball",
+        "american football": "american-football",
+        "esports": "esports",
+        "e sports": "esports",
+    }
+    return aliases.get(text, text.replace(" ", "-") if text else "")
+
+
+# ---- Stake multi-sport loader ------------------------------------------------
+
+def _stake_fixture_list_v17(sport):
+    errors = []
+    source = "schedule"
+    try:
+        payload = stake_get(f"/schedule/sport/{sport}")
+        fixtures = _flatten_stake_schedule(payload)
+        if not fixtures:
+            raise ValueError("schedule response contained no fixtures")
+    except Exception as schedule_exc:
+        source = "sport-fixture-fallback"
+        try:
+            payload = stake_get(f"/sport/{sport}/fixture")
+            fixtures = extract_fixture_list(payload)
+            errors.append(f"schedule-fallback: {type(schedule_exc).__name__}: {schedule_exc}")
+        except Exception as exc:
+            return {
+                "sport": sport,
+                "source": None,
+                "fixtures": [],
+                "raw": 0,
+                "virtual": 0,
+                "errors": [
+                    f"schedule: {type(schedule_exc).__name__}: {schedule_exc}",
+                    f"fixture-list: {type(exc).__name__}: {exc}",
+                ],
+            }
+
+    raw_count = len(fixtures)
+    real = [f for f in fixtures if not _is_virtual_stake_fixture(f)]
+    virtual = raw_count - len(real)
+
+    def sort_key(fixture):
+        value = fixture.get("startTime") or fixture.get("date")
+        try:
+            n = float(value)
+            if n > 10_000_000_000:
+                n /= 1000.0
+            return n
+        except (TypeError, ValueError):
+            parsed = _parse_start_time(value)
+            return parsed.timestamp() if parsed else float("inf")
+
+    real.sort(key=sort_key)
+    selected = [
+        f for f in real[:STAKE_FIXTURE_LIMIT_PER_SPORT]
+        if isinstance(f, dict) and str(f.get("slug") or f.get("id") or "").strip()
+    ]
+    return {
+        "sport": sport,
+        "source": source,
+        "fixtures": selected,
+        "raw": raw_count,
+        "virtual": virtual,
+        "errors": errors,
+    }
+
+
+def fetch_stake_markets():
+    if not STAKE_API_KEY:
+        return {
+            "ok": False,
+            "fixtures": [],
+            "markets": [],
+            "errors": ["STAKE_API_KEY is not configured"],
+            "fixtureSource": None,
+            "rawFixturesDiscovered": 0,
+            "virtualFixturesFiltered": 0,
+            "perSport": {},
+        }
+
+    sport_rows = []
+    schedule_workers = max(1, min(len(STAKE_SPORTS), 4))
+    with ThreadPoolExecutor(max_workers=schedule_workers) as pool:
+        futures = [pool.submit(_stake_fixture_list_v17, sport) for sport in STAKE_SPORTS]
+        for future in futures:
+            sport_rows.append(future.result())
+
+    all_errors = []
+    fixtures_meta = []
+    markets = []
+    per_sport = {}
+    detail_jobs = []
+
+    for row in sport_rows:
+        sport = row["sport"]
+        per_sport[sport] = {
+            "fixtureSource": row.get("source"),
+            "rawFixturesDiscovered": row.get("raw", 0),
+            "virtualFixturesFiltered": row.get("virtual", 0),
+            "fixturesSelected": len(row.get("fixtures", [])),
+            "fixturesLoaded": 0,
+            "marketsLoaded": 0,
+            "errors": list(row.get("errors", [])),
+        }
+        all_errors.extend([f"{sport}: {e}" for e in row.get("errors", [])])
+        for fixture in row.get("fixtures", []):
+            detail_jobs.append((sport, fixture))
+
+    def fetch_one(job):
+        sport, fixture = job
+        slug = str(fixture.get("slug") or fixture.get("id") or "").strip()
+        meta = {
+            "sport": sport,
+            "slug": slug,
+            "id": fixture.get("id"),
+            "name": fixture.get("name"),
+            "startTime": fixture.get("startTime") or fixture.get("date"),
+            "tournament": fixture.get("tournament"),
+            "category": fixture.get("category"),
+        }
+        try:
+            raw = stake_get(f"/fixtures/{slug}")
+            parsed = parse_fixture_recursive(raw)
+            # The schedule endpoint itself tells us the sport.  Force that hint
+            # so a detail payload that omits sport cannot fall back to football.
+            for market in parsed:
+                market["sport"] = sport
+            return sport, meta, parsed, None
+        except Exception as exc:
+            return sport, meta, [], f"{slug}: {type(exc).__name__}: {exc}"
+
+    with ThreadPoolExecutor(max_workers=STAKE_DETAIL_WORKERS) as pool:
+        for sport, meta, parsed, error in pool.map(fetch_one, detail_jobs):
+            fixtures_meta.append(meta)
+            per_sport[sport]["fixturesLoaded"] += 1
+            per_sport[sport]["marketsLoaded"] += len(parsed)
+            markets.extend(parsed)
+            if error:
+                per_sport[sport]["errors"].append(error)
+                all_errors.append(f"{sport}: {error}")
+
+    fatal = [e for e in all_errors if "schedule-fallback:" not in e]
+    return {
+        "ok": len(fatal) == 0,
+        "fixtures": fixtures_meta,
+        "markets": markets,
+        "errors": all_errors,
+        "fixtureSource": "multi-sport",
+        "rawFixturesDiscovered": sum(x.get("raw", 0) for x in sport_rows),
+        "virtualFixturesFiltered": sum(x.get("virtual", 0) for x in sport_rows),
+        "perSport": per_sport,
+    }
+
+
+# ---- Shuffle parser/loader ---------------------------------------------------
+
+def _shuffle_upcoming_body_v17(cursor=None, shuffle_sport="SOCCER", prioritized_market_type_id=None):
+    variables = {
+        "first": SHUFFLE_FIXTURE_PAGE_SIZE,
+        "language": "en",
+        "searchType": "UPCOMING_ONLY",
+        "sports": shuffle_sport,
+    }
+    if cursor:
+        variables["cursor"] = cursor
+    if prioritized_market_type_id:
+        variables["prioritizedMarketTypeId"] = prioritized_market_type_id
+    return {
+        "operationName": "GetSportsFixtures",
+        "variables": variables,
+        "extensions": {
+            "clientLibrary": {"name": "@apollo/client", "version": "4.1.6"}
+        },
+        "query": SHUFFLE_UPCOMING_QUERY,
+    }
+
+
+# Preserve compatibility for old/custom functions that still call this name.
+def _shuffle_upcoming_body(cursor=None):
+    return _shuffle_upcoming_body_v17(cursor=cursor, shuffle_sport="SOCCER")
+
+
+def parse_shuffle_markets(payload, sport_hint=None):
+    """v17 parser: collect every market bundle inside defaultMarketsInfo.
+
+    Shuffle can expose more than only defaultMarket/threewayDefaultMarkets for
+    non-soccer sports.  Recursively collecting display+odds bundles lets us see
+    two-way Match Winner, handicap and total defaults when the API provides them.
+    """
+    root = payload.get("data", payload) if isinstance(payload, dict) else payload
+    markets = []
+    seen = set()
+
+    def parse_default_tree(obj, fixture_ctx, path, depth=0):
+        if depth > 12:
+            return
+        if isinstance(obj, list):
+            for i, item in enumerate(obj):
+                parse_default_tree(item, fixture_ctx, f"{path}[{i}]", depth + 1)
+            return
+        if not isinstance(obj, dict):
+            return
+
+        if isinstance(obj.get("display"), dict) and isinstance(obj.get("odds"), list):
+            _parse_shuffle_market_bundle(obj, fixture_ctx, path, markets, seen)
+
+        for key, value in obj.items():
+            if key in {"display", "odds"}:
+                continue
+            if isinstance(value, (dict, list)):
+                parse_default_tree(value, fixture_ctx, f"{path}.{key}", depth + 1)
+
+    def walk(node, ctx, path="$", depth=0):
+        if depth > 30:
+            return
+        if isinstance(node, list):
+            for i, item in enumerate(node):
+                walk(item, ctx, f"{path}[{i}]", depth + 1)
+            return
+        if not isinstance(node, dict):
+            return
+
+        c = dict(ctx)
+        if sport_hint and not c.get("sport"):
+            c["sport"] = sport_hint
+
+        category = node.get("category")
+        if isinstance(category, dict):
+            sport = category.get("sports") or category.get("sport")
+            if sport:
+                c["sport"] = str(sport)
+            category_name = category.get("name")
+            if category_name:
+                c["category"] = str(category_name)
+
+        if isinstance(node.get("fixtures"), dict):
+            tournament = node.get("name") or node.get("title")
+            if tournament:
+                c["tournament"] = str(tournament)
+
+        default_info = node.get("defaultMarketsInfo")
+        if isinstance(default_info, dict):
+            home, away = _shuffle_competitor_names(node)
+            event = str(node.get("name") or "").strip()
+            if not event and home and away:
+                event = f"{home} - {away}"
+            fixture_ctx = dict(c)
+            fixture_ctx.update({
+                "eventId": str(node.get("id") or node.get("slug") or ""),
+                "event": event,
+                "team1": home,
+                "team2": away,
+                "startTime": node.get("startTime"),
+                "status": node.get("status"),
+            })
+            parse_default_tree(
+                default_info,
+                fixture_ctx,
+                f"{path}.defaultMarketsInfo",
+            )
+
+        for key, value in node.items():
+            if key == "defaultMarketsInfo":
+                continue
+            walk(value, c, f"{path}.{key}", depth + 1)
+
+    walk(root, {"sport": sport_hint} if sport_hint else {})
+    return markets
+
+
+def _shuffle_scan_v17(stake_sport, shuffle_sport, family=None, market_type_id=None, max_pages=None):
+    markets = []
+    errors = []
+    pages_loaded = 0
+    fixtures_discovered = 0
+    cursor = None
+    max_pages = max_pages or SHUFFLE_MAX_PAGES
+
+    try:
+        for page_index in range(max_pages):
+            body = _shuffle_upcoming_body_v17(
+                cursor=cursor,
+                shuffle_sport=shuffle_sport,
+                prioritized_market_type_id=market_type_id,
+            )
+            response = requests.post(
+                SHUFFLE_GRAPHQL_URL,
+                headers=_shuffle_headers(),
+                json=body,
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            pages_loaded += 1
+
+            gql_errors = payload.get("errors", []) if isinstance(payload, dict) else []
+            if gql_errors:
+                errors.extend([
+                    {
+                        "sport": stake_sport,
+                        "family": family or "default",
+                        "page": page_index + 1,
+                        "error": item,
+                    }
+                    for item in gql_errors
+                ])
+
+            page_markets = parse_shuffle_markets(payload, sport_hint=stake_sport)
+            for market in page_markets:
+                market["sport"] = stake_sport
+                if family:
+                    market["requestedMarketFamily"] = family
+                if market_type_id:
+                    market["prioritizedMarketTypeId"] = market_type_id
+            markets.extend(page_markets)
+
+            sf = (
+                payload.get("data", {}).get("sportsFixtures")
+                if isinstance(payload, dict) and isinstance(payload.get("data"), dict)
+                else None
+            )
+            if not isinstance(sf, dict):
+                break
+            nodes = sf.get("nodes")
+            if isinstance(nodes, list):
+                fixtures_discovered += len(nodes)
+            next_cursor = sf.get("nextCursor")
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+    except Exception as exc:
+        errors.append({
+            "sport": stake_sport,
+            "family": family or "default",
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+
+    return {
+        "sport": stake_sport,
+        "shuffleSport": shuffle_sport,
+        "family": family or "default",
+        "marketTypeId": market_type_id,
+        "pagesLoaded": pages_loaded,
+        "fixturesDiscovered": fixtures_discovered,
+        "markets": markets,
+        "errors": errors,
+    }
+
+
+def fetch_shuffle_markets():
+    if SHUFFLE_SCAN_MODE == "CUSTOM":
+        return _fetch_shuffle_markets_pre_v9()
+
+    specs = []
+    for sport in STAKE_SPORTS:
+        shuffle_sport = _STAKE_TO_SHUFFLE_SPORT_V17.get(sport)
+        if not shuffle_sport:
+            specs.append((sport, None, "unsupported", None, 1))
+            continue
+
+        if _canonical_sport_v17(sport) == "soccer":
+            # Keep the proven v16 soccer Total + Handicap scans.
+            specs.extend([
+                (sport, shuffle_sport, "total", SHUFFLE_TOTAL_MARKET_TYPE_ID, SHUFFLE_MAX_PAGES),
+                (sport, shuffle_sport, "spread", SHUFFLE_HANDICAP_MARKET_TYPE_ID, SHUFFLE_MAX_PAGES),
+            ])
+        else:
+            # For non-soccer, the normal default feed can contain several
+            # two-way defaults.  v17's generic parser collects all of them.
+            specs.append((sport, shuffle_sport, None, None, SHUFFLE_OTHER_SPORT_MAX_PAGES))
+
+    scans = []
+    runnable = [x for x in specs if x[1]]
+    max_workers = max(1, min(len(runnable), 6))
+    if runnable:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [
+                pool.submit(_shuffle_scan_v17, sport, ssport, family, market_id, pages)
+                for sport, ssport, family, market_id, pages in runnable
+            ]
+            scans.extend(f.result() for f in futures)
+
+    for sport, ssport, family, market_id, pages in specs:
+        if ssport:
+            continue
+        scans.append({
+            "sport": sport,
+            "shuffleSport": None,
+            "family": family,
+            "marketTypeId": market_id,
+            "pagesLoaded": 0,
+            "fixturesDiscovered": 0,
+            "markets": [],
+            "errors": [{"sport": sport, "error": "No Shuffle enum mapping configured"}],
+        })
+
+    all_markets = []
+    all_errors = []
+    for scan in scans:
+        all_markets.extend(scan.get("markets", []))
+        all_errors.extend(scan.get("errors", []))
+
+    unique = []
+    seen = set()
+    for market in all_markets:
+        desc = _market_descriptor_v9(market)
+        descriptor_key = desc.get("key") if desc else (
+            _norm_text(market.get("market")),
+            _coerce_float(market.get("lineValue")),
+        )
+        key = (
+            _canonical_sport_v17(market.get("sport")),
+            market.get("eventId") or _norm_text(market.get("event")),
+            descriptor_key,
+            tuple(sorted(
+                (_norm_text(outcome.get("selection")), float(outcome.get("odds") or 0))
+                for outcome in market.get("outcomes", [])
+            )),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(market)
+
+    per_sport = {}
+    for sport in STAKE_SPORTS:
+        sport_key = _canonical_sport_v17(sport)
+        sport_markets = [m for m in unique if _canonical_sport_v17(m.get("sport")) == sport_key]
+        sport_scans = [s for s in scans if _canonical_sport_v17(s.get("sport")) == sport_key]
+        per_sport[sport] = {
+            "pagesLoaded": sum(s.get("pagesLoaded", 0) for s in sport_scans),
+            "fixturesDiscovered": max([s.get("fixturesDiscovered", 0) for s in sport_scans] or [0]),
+            "marketsLoaded": len(sport_markets),
+            "errors": [e for s in sport_scans for e in s.get("errors", [])],
+        }
+
+    scan_info = [
+        {
+            "sport": s.get("sport"),
+            "shuffleSport": s.get("shuffleSport"),
+            "family": s.get("family"),
+            "marketTypeId": s.get("marketTypeId"),
+            "pagesLoaded": s.get("pagesLoaded", 0),
+            "fixturesDiscovered": s.get("fixturesDiscovered", 0),
+            "marketsLoaded": len(s.get("markets", [])),
+            "errors": s.get("errors", []),
+        }
+        for s in scans
+    ]
+
+    return {
+        "ok": len(all_errors) == 0,
+        "stage": "complete",
+        "scanMode": "UPCOMING_MULTI_SPORT_TWO_WAY",
+        "pagesLoaded": sum(s.get("pagesLoaded", 0) for s in scans),
+        "fixturesDiscovered": sum(v.get("fixturesDiscovered", 0) for v in per_sport.values()),
+        "markets": unique,
+        "errors": all_errors,
+        "prioritizedScans": scan_info,
+        "perSport": per_sport,
+    }
+
+
+# ---- Multi-sport-safe matching and market descriptors -----------------------
+
+_event_match_v16 = _event_match
+_event_group_key_v16 = _event_group_key_v9
+_market_descriptor_v16 = _market_descriptor_v9
+_canonical_selection_v16 = _canonical_selection_v9
+_cross_book_candidate_v16 = _cross_book_candidate_v10
+_candidate_fingerprint_v16 = _candidate_fingerprint_v14
+
+
+def _event_match(market_a, market_b):
+    sport_a = _canonical_sport_v17(market_a.get("sport"))
+    sport_b = _canonical_sport_v17(market_b.get("sport"))
+    if sport_a and sport_b and sport_a != sport_b:
+        return 0.0, False
+    return _event_match_v16(market_a, market_b)
+
+
+def _event_group_key_v9(market):
+    return f"{_canonical_sport_v17(market.get('sport'))}|{_event_group_key_v16(market)}"
+
+
+def _market_descriptor_v9(market, swapped=False):
+    # First preserve every v16 Total/Handicap rule exactly.
+    desc = _market_descriptor_v16(market, swapped=swapped)
+    if desc:
+        return desc
+
+    outcomes = [x for x in (market.get("outcomes", []) or []) if isinstance(x, dict)]
+    if len(outcomes) != 2 or not _is_main_match_market_v9(market):
+        return None
+
+    sport = _canonical_sport_v17(market.get("sport"))
+    if sport in {"", "soccer"}:
+        # Soccer 1X2/DNB remains intentionally out of the scanner.
+        return None
+
+    raw = " " + _norm_text(_raw_market_text(market)) + " "
+    unsafe = (
+        " draw no bet ", " dnb ", " regulation ", " regular time ",
+        " 60 minutes ", " three way ", " threeway ", " 3 way ",
+        " qualification ", " qualify ",
+    )
+    if _contains_any(raw, unsafe):
+        return None
+
+    moneyline_terms = (
+        " moneyline ", " money line ", " match winner ",
+        " match winning ", " winner ", " to win ", " match result ",
+    )
+    if not _contains_any(raw, moneyline_terms):
+        return None
+
+    sides = {_selection_team_side_v9(market, x) for x in outcomes}
+    sides.discard(None)
+    if sides != {"1", "2"}:
+        return None
+
+    return {
+        "family": "moneyline",
+        "key": "moneyline",
+        "line": None,
+        "label": "Moneyline / Match Winner",
+    }
+
+
+def _expected_labels_v9(family):
+    if family == "total":
+        return ("over", "under")
+    if family in {"spread", "moneyline"}:
+        return ("1", "2")
+    return ()
+
+
+def _canonical_selection_v9(market, outcome, descriptor, swapped=False):
+    if descriptor.get("family") == "moneyline":
+        label = _selection_team_side_v9(market, outcome)
+        if swapped and label in {"1", "2"}:
+            label = "2" if label == "1" else "1"
+        return label
+    return _canonical_selection_v16(market, outcome, descriptor, swapped=swapped)
+
+
+V9_SUPPORTED_FAMILIES = ("total", "spread", "moneyline")
+
+
+def _cross_book_candidate_v10(pair, key, descriptor, bankroll):
+    result = _cross_book_candidate_v16(pair, key, descriptor, bankroll)
+    if result:
+        result["sport"] = _canonical_sport_v17(pair["stake"].get("sport"))
+    return result
+
+
+def find_twoway_candidates_v10(markets, bankroll):
+    results = []
+    seen = set()
+    for pair in find_event_matches_v9(markets):
+        stake_map = _descriptor_map_v9(pair["stakeMarkets"], swapped=False)
+        shuffle_map = _descriptor_map_v9(pair["shuffleMarkets"], swapped=pair["swapped"])
+        common_keys = sorted(set(stake_map) & set(shuffle_map))
+        for key in common_keys:
+            descriptor = stake_map[key]["descriptor"]
+            teams = _event_teams(pair["stake"])
+            sport = _canonical_sport_v17(pair["stake"].get("sport"))
+            unique_key = (sport, teams, key)
+            if unique_key in seen:
+                continue
+            candidate = _cross_book_candidate_v10(pair, key, descriptor, bankroll)
+            if not candidate:
+                continue
+            seen.add(unique_key)
+            results.append(candidate)
+    return sorted(results, key=lambda x: x["arbPercent"], reverse=True)
+
+
+def _candidate_fingerprint_v14(item):
+    return f"{item.get('sport') or ''}|{_candidate_fingerprint_v16(item)}"
+
+
+def _format_alert_message_v14(item):
+    lines = [
+        "🚨 Stake ↔ Shuffle arbitrage",
+        f"Sport: {str(item.get('sport') or 'unknown').replace('-', ' ').title()}",
+        f"Event: {item.get('event')}",
+        f"Market: {item.get('market')}",
+        f"Arb: {float(item.get('arbPercent') or 0):.2f}%",
+        f"Bankroll: {float(item.get('bankroll') or ALERT_BANKROLL):.2f}",
+        f"Guaranteed profit: {float(item.get('balancedProfit') or 0):.2f}",
+        "",
+    ]
+    for leg in item.get("legs", []) or []:
+        lines.append(
+            f"{leg.get('bookmaker')}: {leg.get('selection')} @ {leg.get('odds')} — stake {leg.get('stake')}"
+        )
+    lines.extend([
+        "",
+        "Re-check both live odds and market settlement before placing bets.",
+    ])
+    return "\n".join(lines)
+
+
+def _sport_counts_v17(markets, bookmaker):
+    result = {}
+    for sport in STAKE_SPORTS:
+        key = _canonical_sport_v17(sport)
+        subset = [
+            m for m in markets
+            if m.get("bookmaker") == bookmaker and _canonical_sport_v17(m.get("sport")) == key
+        ]
+        result[sport] = {
+            "markets": len(subset),
+            "comparable": _market_family_counts_v9(subset, bookmaker),
+        }
+    return result
+
+
+@app.get("/api/sports-status")
+def sports_status_v17():
+    with _SCAN_STATE_LOCK:
+        state = dict(_SCAN_STATE)
+    return jsonify({
+        "ok": True,
+        "version": SCANNER_VERSION,
+        "sports": list(STAKE_SPORTS),
+        "stakeFixtureLimitPerSport": STAKE_FIXTURE_LIMIT_PER_SPORT,
+        "shuffleOtherSportMaxPages": SHUFFLE_OTHER_SPORT_MAX_PAGES,
+        "supportedFamilies": list(V9_SUPPORTED_FAMILIES),
+        "backgroundThreadAlive": bool(_BACKGROUND_THREAD and _BACKGROUND_THREAD.is_alive()),
+        "scanIntervalSeconds": SCAN_INTERVAL_SECONDS,
+        "state": state,
+    })
+
+
+@app.get("/api/sports-debug")
+def sports_debug_v17():
+    try:
+        stake_data, shuffle_data, fetch_seconds = fetch_both_books_parallel()
+        combined = stake_data.get("markets", []) + shuffle_data.get("markets", [])
+        matches = find_event_matches_v9(combined)
+        candidates = find_twoway_candidates_v10(combined, ALERT_BANKROLL)
+
+        matched_by_sport = {sport: 0 for sport in STAKE_SPORTS}
+        for pair in matches:
+            sport = _canonical_sport_v17(pair["stake"].get("sport"))
+            for configured in STAKE_SPORTS:
+                if _canonical_sport_v17(configured) == sport:
+                    matched_by_sport[configured] += 1
+                    break
+
+        candidates_by_sport = {sport: 0 for sport in STAKE_SPORTS}
+        for item in candidates:
+            sport = _canonical_sport_v17(item.get("sport"))
+            for configured in STAKE_SPORTS:
+                if _canonical_sport_v17(configured) == sport:
+                    candidates_by_sport[configured] += 1
+                    break
+
+        return jsonify({
+            "ok": True,
+            "version": SCANNER_VERSION,
+            "fetchSeconds": fetch_seconds,
+            "sports": list(STAKE_SPORTS),
+            "supportedFamilies": list(V9_SUPPORTED_FAMILIES),
+            "stakePerSport": stake_data.get("perSport", {}),
+            "shufflePerSport": shuffle_data.get("perSport", {}),
+            "stakeMarketCounts": _sport_counts_v17(combined, "Stake"),
+            "shuffleMarketCounts": _sport_counts_v17(combined, "Shuffle"),
+            "matchedEventsBySport": matched_by_sport,
+            "candidatesBySport": candidates_by_sport,
+            "totalCandidates": len(candidates),
+            "positiveArbitrages": sum(1 for x in candidates if x.get("isArbitrage")),
+            "closest": candidates[:10],
+            "errors": {
+                "stake": stake_data.get("errors", []),
+                "shuffle": shuffle_data.get("errors", []),
+            },
+        })
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "version": SCANNER_VERSION,
+            "stage": "sports-debug",
+            "errorType": type(exc).__name__,
+            "error": str(exc),
+        }), 500
+
+
+# v16 starts the daemon lazily from Flask's before_request hook.
+# This avoids losing the daemon when Gunicorn imports/preloads the app before
+# forking its worker. Keep Gunicorn at one worker for duplicate-free alerts.
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=True)
